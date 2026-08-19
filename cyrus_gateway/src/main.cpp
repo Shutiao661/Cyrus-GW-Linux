@@ -35,7 +35,11 @@ int main(int argc, char* argv[]) {
     Logger::instance().set_level(LogLevel::DEBUG);
     LOG_INFO("============================================");
     LOG_INFO("  Cyrus-GW Gateway v1.0.0");
+#if CYRUS_PLATFORM_WINDOWS
     LOG_INFO("  Platform: Windows (IOCP)");
+#else
+    LOG_INFO("  Platform: Linux (io_uring)");
+#endif
     LOG_INFO("============================================");
 
     // ========================================================================

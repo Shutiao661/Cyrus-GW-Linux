@@ -169,15 +169,15 @@ bool Server::create_listen_socket() {
     // 创建 TCP socket
     listen_fd_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listen_fd_ == INVALID_SOCKET_VAL) {
-        LOG_ERROR("Failed to create listen socket: {}", WSAGetLastError());
+        LOG_ERROR("Failed to create listen socket: {}", cyrus_socket_error());
         return false;
     }
 
     // 设置 SO_REUSEADDR (允许快速重启, 即使端口处于 TIME_WAIT)
     int reuse = 1;
     if (setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR,
-                   reinterpret_cast<const char*>(&reuse), sizeof(reuse)) == SOCKET_ERROR) {
-        LOG_WARN("setsockopt(SO_REUSEADDR) failed: {}", WSAGetLastError());
+                   reinterpret_cast<const char*>(&reuse), sizeof(reuse)) == SOCKET_ERROR_VAL) {
+        LOG_WARN("setsockopt(SO_REUSEADDR) failed: {}", cyrus_socket_error());
         // 非致命错误, 继续
     }
 
@@ -194,17 +194,17 @@ bool Server::create_listen_socket() {
         inet_pton(AF_INET, listen_address_.c_str(), &addr.sin_addr);
     }
 
-    if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
+    if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR_VAL) {
         LOG_ERROR("Failed to bind to {}:{}: {}",
-                  listen_address_, listen_port_, WSAGetLastError());
+                  listen_address_, listen_port_, cyrus_socket_error());
         cyrus_close_socket(listen_fd_);
         listen_fd_ = INVALID_SOCKET_VAL;
         return false;
     }
 
     // 开始监听 (backlog = SOMAXCONN: 使用系统最大等待队列)
-    if (listen(listen_fd_, SOMAXCONN) == SOCKET_ERROR) {
-        LOG_ERROR("Failed to listen: {}", WSAGetLastError());
+    if (listen(listen_fd_, SOMAXCONN) == SOCKET_ERROR_VAL) {
+        LOG_ERROR("Failed to listen: {}", cyrus_socket_error());
         cyrus_close_socket(listen_fd_);
         listen_fd_ = INVALID_SOCKET_VAL;
         return false;
@@ -218,13 +218,13 @@ bool Server::create_listen_socket() {
 // post_accept() - 投递异步 Accept
 // ============================================================================
 bool Server::post_accept() {
-    IOCPContext* ctx = static_cast<IOEngineIocp*>(engine_.get())->acquire_context();
+    IOContext* ctx = engine_->acquire_context();
     ctx->user_data = nullptr;  // 标记为 Accept 操作 (worker_loop 用于区分)
 
     int result = engine_->post_accept(listen_fd_, ctx);
     if (result != 0) {
-        LOG_ERROR("Failed to post accept: {}", WSAGetLastError());
-        static_cast<IOEngineIocp*>(engine_.get())->release_context(ctx);
+        LOG_ERROR("Failed to post accept: err={}", cyrus_socket_error());
+        engine_->release_context(ctx);
         return false;
     }
     return true;
@@ -249,23 +249,21 @@ void Server::worker_loop(int worker_id) {
             // 跳过空事件 (wakeup 事件)
             if (ctx == nullptr) continue;
 
-            IOCPContext* iocp_ctx = static_cast<IOCPContext*>(ctx);
-
             // --- 按操作类型分发 ---
-            switch (iocp_ctx->op) {
+            switch (ctx->op) {
                 case IOOperation::ACCEPT:
-                    on_accept_complete(iocp_ctx);
+                    on_accept_complete(ctx);
                     break;
 
                 case IOOperation::RECV:
                 case IOOperation::SEND: {
                     // user_data 指向 Connection 对象
-                    Connection* conn = static_cast<Connection*>(iocp_ctx->user_data);
+                    Connection* conn = static_cast<Connection*>(ctx->user_data);
                     if (conn) {
-                        if (iocp_ctx->op == IOOperation::RECV) {
-                            conn->on_recv_complete(iocp_ctx);
+                        if (ctx->op == IOOperation::RECV) {
+                            conn->on_recv_complete(ctx);
                         } else {
-                            conn->on_send_complete(iocp_ctx);
+                            conn->on_send_complete(ctx);
                         }
                     }
                     break;
@@ -273,8 +271,8 @@ void Server::worker_loop(int worker_id) {
 
                 default:
                     LOG_WARN("Unknown IO operation type: {}",
-                             static_cast<int>(iocp_ctx->op));
-                    static_cast<IOEngineIocp*>(engine_.get())->release_context(iocp_ctx);
+                             static_cast<int>(ctx->op));
+                    engine_->release_context(ctx);
                     break;
             }
         }
@@ -286,46 +284,47 @@ void Server::worker_loop(int worker_id) {
 // ============================================================================
 // on_accept_complete() - Accept 完成处理
 // ============================================================================
-void Server::on_accept_complete(IOCPContext* ctx) {
-    if (ctx->error != 0 || ctx->accept_socket == INVALID_SOCKET) {
+void Server::on_accept_complete(IOContext* ctx) {
+    if (ctx->error != 0 || ctx->accept_fd == INVALID_SOCKET_VAL) {
         LOG_WARN("Accept failed: err={}", ctx->error);
         // 归还上下文, 重新投递 accept
-        static_cast<IOEngineIocp*>(engine_.get())->release_context(ctx);
+        engine_->release_context(ctx);
         if (g_running.load(std::memory_order_acquire)) {
             post_accept();
         }
         return;
     }
 
-    SOCKET client_fd = ctx->accept_socket;
+    socket_t client_fd = ctx->accept_fd;
 
-    // --- 第 1 步: SO_UPDATE_ACCEPT_CONTEXT (Windows 必须!) ---
-    // 让新 socket 继承监听 socket 的属性 (非阻塞等)
-    setsockopt(client_fd, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
-               reinterpret_cast<const char*>(&listen_fd_), sizeof(listen_fd_));
-
-    // --- 第 2 步: 设置非阻塞 ---
+    // --- 第 1 步: 设置非阻塞 ---
     cyrus_set_nonblocking(client_fd);
 
-    // --- 第 3 步: 禁用 Nagle 算法 (低延迟响应) ---
+#ifdef _WIN32
+    // SO_UPDATE_ACCEPT_CONTEXT: Windows 必须! 让新 socket 继承监听 socket 属性
+    setsockopt(client_fd, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
+               reinterpret_cast<const char*>(&listen_fd_), sizeof(listen_fd_));
+#endif
+
+    // --- 第 2 步: 禁用 Nagle 算法 (低延迟响应) ---
     int nodelay = 1;
     setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY,
                reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
 
-    // --- 第 4 步: 创建 Connection 对象 ---
+    // --- 第 3 步: 创建 Connection 对象 ---
     auto conn = std::make_unique<Connection>(
-        static_cast<socket_t>(client_fd), engine_.get(), pool_.get(),
+        client_fd, engine_.get(), pool_.get(),
         router_.get(), rate_limiter_.get());
 
-    // --- 第 5 步: 启动连接 (注册到 IOCP + 投递第一个 recv) ---
+    // --- 第 4 步: 启动连接 (注册到引擎 + 投递第一个 recv) ---
     Connection* conn_ptr = conn.get();
-    add_connection(static_cast<socket_t>(client_fd), std::move(conn));
+    add_connection(client_fd, std::move(conn));
     conn_ptr->on_accept_complete();
 
-    // --- 第 6 步: 归还 Accept 上下文 ---
-    static_cast<IOEngineIocp*>(engine_.get())->release_context(ctx);
+    // --- 第 5 步: 归还 Accept 上下文 ---
+    engine_->release_context(ctx);
 
-    // --- 第 7 步: 重新投递 Accept (保持多个 accept 在队列中) ---
+    // --- 第 6 步: 重新投递 Accept (保持多个 accept 在队列中) ---
     post_accept();
 }
 

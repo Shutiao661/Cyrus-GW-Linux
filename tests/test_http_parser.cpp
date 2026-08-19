@@ -19,14 +19,13 @@
 #include <cstring>
 #include <string>
 
-// 显式引入 Windows 头文件以确保所有冲突宏已定义, 然后彻底清除
-// (MSVC 的 <string> 实现可能间接包括 <windows.h>, 但不保证)
+#ifdef _WIN32
+// Windows 头文件的宏会污染 C++ 标识符, 必须 #undef
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <winsock2.h>
 #include <windows.h>
 
-// 永久清除与 C++ 标识符冲突的 Windows 宏
 #undef DELETE
 #undef OPTIONS
 #undef ERROR
@@ -36,11 +35,13 @@
 #undef RegisterClass
 #undef IN
 #undef OUT
+#endif
 
 // 直接 include 源文件 (或者链接 gateway 库)
 // 测试中直接使用 header-only 部分
 #include "../cyrus_gateway/include/cyrus/gateway/http_parser.hpp"
 
+using namespace cyrus;
 using namespace cyrus::gateway;
 
 // 测试辅助宏

@@ -68,7 +68,11 @@ public:
         , capacity_(other.capacity_)
         , length_(other.length_)
     {
-        other.pool_ = nullptr;  // 源对象不再拥有所有权
+        other.pool_ = nullptr;
+        other.buffer_index_ = -1;
+        other.data_ = nullptr;
+        other.capacity_ = 0;
+        other.length_ = 0;
     }
 
     BufferHandle& operator=(BufferHandle&& other) noexcept {
@@ -80,6 +84,10 @@ public:
             capacity_ = other.capacity_;
             length_ = other.length_;
             other.pool_ = nullptr;
+            other.buffer_index_ = -1;
+            other.data_ = nullptr;
+            other.capacity_ = 0;
+            other.length_ = 0;
         }
         return *this;
     }

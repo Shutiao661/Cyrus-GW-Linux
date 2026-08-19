@@ -5,6 +5,7 @@
 #include "cyrus/gateway/router.hpp"
 #include "cyrus/gateway/connection.hpp"
 #include "cyrus/gateway/sse_handler.hpp"
+#include "cyrus/chunked_decoder.hpp"
 #include "cyrus/logger.hpp"
 
 #include <sstream>
@@ -178,11 +179,11 @@ h1{color:#333}code{background:#f4f4f4;padding:2px 6px;border-radius:3px}
 </style></head>
 <body>
 <h1> Cyrus-GW Gateway</h1>
-<p>High-performance async HTTP gateway powered by C++20 + Windows IOCP</p>
+<p>High-performance async HTTP gateway powered by C++20 + io_uring</p>
 <h2>Endpoints</h2>
 <div class="endpoint"><code>GET /health</code> — Health check</div>
 <div class="endpoint"><code>POST /v1/chat/completions</code> — Chat completion (SSE streaming)</div>
-<p><small>Platform: Windows | Engine: IOCP | Version: 1.0.0</small></p>
+<p><small>Platform: Linux | Engine: io_uring | Version: 2.0.0</small></p>
 </body>
 </html>)";
     conn->send_response(HttpStatus::OK, "text/html; charset=utf-8", html);
@@ -191,13 +192,30 @@ h1{color:#333}code{background:#f4f4f4;padding:2px 6px;border-radius:3px}
 // --- 健康检查 ---
 void Router::handle_health(Connection* conn, const ParsedRequest& request) {
     std::string json = std::format(
-        R"({{"status":"ok","version":"2.0.0","platform":"Windows","engine":"IOCP","uptime":"ok"}})");
+        R"({{"status":"ok","version":"2.0.0","platform":"{}","engine":"{}","uptime":"ok"}})",
+#if CYRUS_PLATFORM_WINDOWS
+        "Windows", "IOCP"
+#else
+        "Linux", "io_uring"
+#endif
+    );
     conn->send_response(HttpStatus::OK, "application/json", json);
 }
 
-// --- Chat Completion (代理到 Agent + SSE 流式透传) ---
+// --- Chat Completion (流式透传到 Agent + SSE 实时推送给客户端) ---
+// ============================================================================
+// 流程:
+//   1. 获取 Agent 连接 → 编码并发送请求
+//   2. 立即发送 SSE HTTP header 给客户端 (实现真正的流式, 降低首字节延迟)
+//   3. 接收 Agent 响应帧  (MSG_RESPONSE_HEADERS / MSG_RESPONSE_DATA / ...)
+//   4. 若 Agent 使用 chunked TE → ChunkedDecoder 剥离长度行, 输出纯净 SSE
+//   5. 每收到数据块立即通过 send_raw_sync() 推送给客户端
+//   6. 三层超时检测: 首包 / 总耗时 / 帧间空闲
+//   7. SSE header 已发送后 → 错误通过 event: error 传递 (OpenAI 兼容格式)
+//   8. 流结束后关闭连接 (SSE 长连接不复用)
+// ============================================================================
 void Router::handle_chat_completion(Connection* conn, const ParsedRequest& request) {
-    // 获取 Agent 客户端连接
+    // --- 第 1 步: 获取 Agent 连接 ---
     AgentClient* agent = acquire_agent_client();
     if (!agent) {
         LOG_ERROR("No agent available for chat completion");
@@ -206,7 +224,7 @@ void Router::handle_chat_completion(Connection* conn, const ParsedRequest& reque
         return;
     }
 
-    // 编码请求为二进制协议帧
+    // --- 第 2 步: 编码并发送请求到 Agent ---
     std::string body_str(request.body.begin(), request.body.end());
     std::vector<std::pair<std::string, std::string>> headers;
     for (const auto& [name, value] : request.headers) {
@@ -220,7 +238,6 @@ void Router::handle_chat_completion(Connection* conn, const ParsedRequest& reque
         headers,
         body_str);
 
-    // 发送到 Agent (阻塞, localhost)
     if (!agent->send_packet(frame)) {
         LOG_ERROR("Failed to send request to agent");
         conn->send_error(HttpStatus::BAD_GATEWAY,
@@ -229,24 +246,69 @@ void Router::handle_chat_completion(Connection* conn, const ParsedRequest& reque
         return;
     }
 
-    // --- SSE 流式透传: 接收 Agent → 累积 SSE → 一次性 send_response ---
-    // 简化版本: 先收集所有 chunk, 再批量发送
-    // TODO: 生产版本需要非阻塞 Agent recv + 异步逐帧 send
+    // --- 第 3 步: 初始化 SSE 中继器 + 超时配置 ---
     SSERelayTimeout sse_timeout = SSERelayTimeout::from_config(config_);
     SSERelayHandler relay(sse_timeout);
 
-    std::string accumulated_sse;
-    accumulated_sse.reserve(8192);
+    // --- 第 4 步: 立即发送 SSE HTTP header → 客户端可以开始接收数据 ---
+    std::string sse_header = relay.build_sse_header();
+    if (!conn->send_raw_sync(sse_header.data(), sse_header.size())) {
+        LOG_ERROR("Failed to send SSE header, fd={}", static_cast<int>(conn->fd()));
+        release_agent_client(agent);
+        conn->close();
+        return;
+    }
+    // SSE header 已发送 → 后续错误必须通过 event: error 传递
 
-    relay.on_send = [&accumulated_sse](std::string_view sse_data, bool /*is_last*/) {
-        accumulated_sse.append(sse_data);
+    // --- 第 5 步: 设置 ChunkedDecoder (按需启用) ---
+    ChunkedDecoder chunked_decoder;
+    bool use_chunked = false;  // 由 MSG_RESPONSE_HEADERS 决定
+
+    // ChunkedDecoder 输出 → SSERelayHandler 输入
+    chunked_decoder.on_data = [&relay](const uint8_t* data, size_t len) {
+        std::string_view clean(reinterpret_cast<const char*>(data), len);
+        relay.on_agent_data(clean);
     };
 
-    // 接收 Agent 流式响应
+    // --- 第 6 步: SSERelayHandler 输出 → 直接推送给客户端 ---
+    relay.on_send = [conn](std::string_view sse_data, bool /*is_last*/) {
+        if (!sse_data.empty()) {
+            conn->send_raw_sync(sse_data.data(), sse_data.size());
+        }
+    };
+    relay.on_close = []() {
+        // 流结束后的清理在 done_receiving 统一处理
+    };
+
+    // --- 第 7 步: Agent 响应接收循环 (逐帧处理 → 实时推送) ---
     std::vector<uint8_t> frame_data;
     bool stream_ok = false;
+    int consecutive_recv_failures = 0;
+    constexpr int MAX_CONSECUTIVE_FAILURES = 5;  // 连续失败上限
 
-    while (agent->recv_packet(frame_data, 30000)) {
+    while (true) {
+        if (!agent->recv_packet(frame_data, 1000)) {  // 1s 粒度 (仅控制线程阻塞)
+            // recv 失败: 区分超时 (继续) vs 断开 (退出)
+            if (!agent->is_connected()) {
+                LOG_WARN("Agent connection lost during SSE relay");
+                break;
+            }
+            // 超时: 检查 relay 超时, 若未超时继续等待
+            consecutive_recv_failures++;
+            if (consecutive_recv_failures >= MAX_CONSECUTIVE_FAILURES) {
+                LOG_WARN("Agent recv consecutive failures exceeded ({})", MAX_CONSECUTIVE_FAILURES);
+                break;
+            }
+            if (!relay.check_timeout()) {
+                // relay 已超时并发送了 event: error
+                LOG_WARN("SSE relay timeout during Agent recv");
+                goto done_receiving;
+            }
+            continue;
+        }
+        consecutive_recv_failures = 0;  // 成功收取, 重置计数
+
+        // 验证帧完整性
         if (frame_data.size() < sizeof(MessageHeader)) {
             frame_data.clear();
             continue;
@@ -256,66 +318,91 @@ void Router::handle_chat_completion(Connection* conn, const ParsedRequest& reque
         std::memcpy(&resp_header, frame_data.data(), sizeof(MessageHeader));
         size_t payload_offset = sizeof(MessageHeader);
 
+        // --- 按消息类型分发 ---
         switch (resp_header.msg_type) {
-            case MessageType::MSG_RESPONSE_HEADERS:
-                // Agent 返回的响应头: 验证状态码, 提取元数据
-                // 非 200 响应 → 转为错误事件
+
+            case MessageType::MSG_RESPONSE_HEADERS: {
+                // Agent 返回响应头: 检查错误标记 + 检测 Transfer-Encoding
                 if (resp_header.flags & FrameFlags::FLAG_ERROR) {
                     relay.on_agent_error("Agent returned error status", 502);
                     goto done_receiving;
                 }
+                // 检测是否需要 ChunkedDecoder
+                std::string_view headers_payload(
+                    reinterpret_cast<const char*>(frame_data.data() + payload_offset),
+                    frame_data.size() - payload_offset);
+                if (headers_payload.find("chunked") != std::string_view::npos ||
+                    headers_payload.find("CHUNKED") != std::string_view::npos) {
+                    use_chunked = true;
+                    LOG_DEBUG("SSE relay: Agent using chunked TE, enabling ChunkedDecoder");
+                }
                 break;
+            }
 
             case MessageType::MSG_RESPONSE_DATA: {
+                // Agent 返回流式数据块
                 std::string_view chunk(
                     reinterpret_cast<const char*>(frame_data.data() + payload_offset),
                     frame_data.size() - payload_offset);
-                relay.on_agent_data(chunk);
+
+                if (use_chunked) {
+                    // 通过 ChunkedDecoder 剥离 chunk 编码层
+                    chunked_decoder.feed(
+                        reinterpret_cast<const uint8_t*>(chunk.data()), chunk.size());
+                    if (chunked_decoder.is_error()) {
+                        LOG_ERROR("ChunkedDecoder error: {}", chunked_decoder.error_message());
+                        relay.on_agent_error("Chunked decode error", 502);
+                        goto done_receiving;
+                    }
+                } else {
+                    // 直通: payload 即为纯净 SSE 文本
+                    relay.on_agent_data(chunk);
+                }
                 break;
             }
+
             case MessageType::MSG_RESPONSE_END:
+                // Agent 发送流结束标记
                 relay.on_stream_complete();
                 stream_ok = true;
                 goto done_receiving;
 
             case MessageType::MSG_ERROR: {
-                std::string_view err(
+                // Agent 返回显式错误帧
+                std::string_view err_msg(
                     reinterpret_cast<const char*>(frame_data.data() + payload_offset),
                     frame_data.size() - payload_offset);
-                relay.on_agent_error(err, 502);
+                relay.on_agent_error(err_msg, 502);
                 goto done_receiving;
             }
 
             default:
+                LOG_DEBUG("SSE relay: unknown msg_type={}", static_cast<int>(resp_header.msg_type));
                 break;
         }
 
         frame_data.clear();
 
+        // 每帧处理后检查超时
         if (!relay.check_timeout()) {
-            LOG_WARN("SSE relay timeout");
-            break;
+            LOG_WARN("SSE relay timeout after processing frame");
+            goto done_receiving;
         }
     }
 
-    // Agent 连接断开或超时
+    // --- 第 8 步: 循环退出 (Agent 断开/超时/recv 连续失败) ---
     if (!stream_ok && relay.is_active()) {
-        relay.on_agent_error("Agent connection lost", 504);
+        relay.on_agent_error("Agent connection lost or unresponsive", 504);
     }
 
 done_receiving:
     release_agent_client(agent);
 
-    // 构建完整 SSE HTTP 响应并发送
-    std::string full_response;
-    full_response.reserve(256 + accumulated_sse.size());
-    full_response += relay.build_sse_header();
-    full_response += accumulated_sse;
+    // 流结束后关闭客户端连接 (SSE 长连接不复用)
+    conn->close();
 
-    conn->send_sse_response(full_response);
-
-    LOG_INFO("Chat completion SSE relay ended (stream_ok={}, sse_bytes={})",
-             stream_ok, accumulated_sse.size());
+    LOG_INFO("Chat completion SSE relay ended (stream_ok={}, chunked={})",
+             stream_ok, use_chunked);
 }
 
 } // namespace gateway

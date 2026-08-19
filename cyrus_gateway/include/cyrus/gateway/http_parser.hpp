@@ -213,6 +213,7 @@ private:
     size_t parse_body(const uint8_t* data, size_t len, size_t& consumed);
     size_t parse_chunk_size(const uint8_t* data, size_t len, size_t& consumed);
     size_t parse_chunk_data(const uint8_t* data, size_t len, size_t& consumed);
+    size_t parse_chunk_trailer(const uint8_t* data, size_t len, size_t& consumed);
 
     // --- 头部处理 ---
     // 当一个头部解析完成后调用 (头部名: 头部值)

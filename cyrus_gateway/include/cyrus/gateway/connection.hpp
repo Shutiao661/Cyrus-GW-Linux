@@ -104,6 +104,10 @@ private:
                                     std::string_view body,
                                     bool keep_alive);
 
+    // 同步发送原始字节 (用于 SSE 流式透传, 在 worker 线程中调用)
+    // 循环 ::send() 直到全部发送或失败, 返回 true 表示成功
+    bool send_raw_sync(const void* data, size_t len);
+
     // 转换到空闲状态 (keep-alive)
     void transition_to_idle();
 

@@ -200,7 +200,6 @@ private:
         }
 
         // 读取 4 字节长度 (网络字节序 → 主机字节序)
-        // 在 Windows 上 ntohl 在 <winsock2.h> 中定义
         uint32_t payload_len;
         std::memcpy(&payload_len, buffer_.data(), sizeof(uint32_t));
         payload_len = ntohl(payload_len);
@@ -227,7 +226,7 @@ private:
         }
 
         // 从缓冲区移除已处理的帧数据
-        buffer_.erase(buffer_.begin(), buffer_.begin() + total_needed);
+        buffer_.erase(buffer_.begin(), buffer_.begin() + static_cast<ptrdiff_t>(total_needed));
         return true;  // 成功解码, 继续尝试
     }
 

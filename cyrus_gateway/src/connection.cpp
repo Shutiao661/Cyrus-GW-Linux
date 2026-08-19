@@ -84,7 +84,7 @@ void Connection::start_reading() {
     }
 
     // 投递异步 recv
-    IOCPContext* ctx = static_cast<IOEngineIocp*>(engine_)->acquire_context();
+    IOContext* ctx = engine_->acquire_context();
     ctx->buffer = recv_buffer_.data();
     ctx->buffer_len = recv_buffer_.capacity();
     ctx->user_data = this;
@@ -92,9 +92,9 @@ void Connection::start_reading() {
     int result = engine_->post_recv(fd_, ctx);
     if (result != 0) {
         LOG_ERROR("Failed to post recv for fd {}: err={}",
-                  static_cast<int>(fd_), WSAGetLastError());
+                  static_cast<int>(fd_), cyrus_socket_error());
         // 归还上下文
-        static_cast<IOEngineIocp*>(engine_)->release_context(ctx);
+        engine_->release_context(ctx);
         close();
         return;
     }
@@ -107,15 +107,28 @@ void Connection::start_reading() {
 // ============================================================================
 // 将收到的数据喂入 HTTP 解析器, 检查是否完成解析
 void Connection::on_recv_complete(IOContext* base_ctx) {
-    IOCPContext* ctx = static_cast<IOCPContext*>(base_ctx);
+    IOContext* ctx = base_ctx;
     last_activity_ = std::chrono::steady_clock::now();
 
     if (ctx->bytes_transferred == 0 || ctx->error != 0) {
         // 连接关闭 (客户端断开) 或错误
+        // 关键修复: 检测 body 截断 — 若解析器正在 BODY/CHUNK 状态且
+        // 已读取部分 body 但未达到 Content-Length, 记录截断事件
+        auto ps = parser_.state();
+        if (ps == ParseState::BODY || ps == ParseState::CHUNK_SIZE ||
+            ps == ParseState::CHUNK_DATA || ps == ParseState::CHUNK_TRAILER) {
+            const auto& req = parser_.result();
+            LOG_WARN("Body truncated on connection close: fd={}, "
+                     "content_length={}, body_read={}, uri={}",
+                     static_cast<int>(fd_),
+                     req.has_content_length ? req.content_length() : 0,
+                     req.body.size(),
+                     req.uri);
+        }
         LOG_DEBUG("Connection closed by client: fd={}, bytes={}, err={}",
                   static_cast<int>(fd_), ctx->bytes_transferred, ctx->error);
         close();
-        static_cast<IOEngineIocp*>(engine_)->release_context(ctx);
+        engine_->release_context(ctx);
         return;
     }
 
@@ -130,7 +143,7 @@ void Connection::on_recv_complete(IOContext* base_ctx) {
         LOG_WARN("HTTP parse error on fd {}: consumed {} of {} bytes",
                  static_cast<int>(fd_), consumed, recv_buffer_.length());
         send_error(HttpStatus::BAD_REQUEST, "Bad Request");
-        static_cast<IOEngineIocp*>(engine_)->release_context(ctx);
+        engine_->release_context(ctx);
         recv_buffer_ = BufferHandle();  // 释放接收缓冲区
         return;
     }
@@ -151,8 +164,8 @@ void Connection::on_recv_complete(IOContext* base_ctx) {
                                  recv_buffer_.data() + recv_buffer_.length());
         }
 
-        // 释放 IOCPContext 和接收缓冲区 (处理请求时会重新分配)
-        static_cast<IOEngineIocp*>(engine_)->release_context(ctx);
+        // 释放 IOContext 和接收缓冲区 (处理请求时会重新分配)
+        engine_->release_context(ctx);
         recv_buffer_ = BufferHandle();
 
         // 重置 body 计时器
@@ -162,8 +175,26 @@ void Connection::on_recv_complete(IOContext* base_ctx) {
         handle_request();
     } else {
         // --- 需要更多数据 ---
+        // 关键修复: 即使 parser 未完成, 也保留未消费的字节
+        // (正常路径下 BODY 状态 consumed == len, 此检查为安全防护)
+        if (consumed < recv_buffer_.length()) {
+            size_t remaining = recv_buffer_.length() - consumed;
+            LOG_DEBUG("Partial consume: {} bytes unconsumed in non-complete state on fd {}",
+                      remaining, static_cast<int>(fd_));
+            // 将未消费字节复制到 pending_data_ 头部 (保留旧的 pending_data_)
+            std::vector<uint8_t> new_pending;
+            new_pending.reserve(pending_data_.size() + remaining);
+            new_pending.assign(recv_buffer_.data() + consumed,
+                              recv_buffer_.data() + recv_buffer_.length());
+            if (!pending_data_.empty()) {
+                new_pending.insert(new_pending.end(),
+                                  pending_data_.begin(), pending_data_.end());
+            }
+            pending_data_ = std::move(new_pending);
+        }
+
         // 归还 ctx, 投递下一个 recv
-        static_cast<IOEngineIocp*>(engine_)->release_context(ctx);
+        engine_->release_context(ctx);
         start_reading();
     }
 }
@@ -173,7 +204,7 @@ void Connection::on_recv_complete(IOContext* base_ctx) {
 // ============================================================================
 void Connection::on_send_complete(IOContext* ctx) {
     // 归还发送上下文
-    static_cast<IOEngineIocp*>(engine_)->release_context(static_cast<IOCPContext*>(ctx));
+    engine_->release_context(ctx);
 
     // 释放发送缓冲区 (RAII 归还给池)
     send_buffer_ = BufferHandle();
@@ -272,7 +303,7 @@ void Connection::send_response(HttpStatus status,
     send_buffer_.set_length(response.size());
 
     // 投递异步 send
-    IOCPContext* ctx = static_cast<IOEngineIocp*>(engine_)->acquire_context();
+    IOContext* ctx = engine_->acquire_context();
     ctx->buffer = send_buffer_.data();
     ctx->bytes_transferred = send_buffer_.length();  // 待发送长度
     ctx->user_data = this;
@@ -280,8 +311,8 @@ void Connection::send_response(HttpStatus status,
     int result = engine_->post_send(fd_, ctx);
     if (result != 0) {
         LOG_ERROR("Failed to post send for fd {}: err={}",
-                  static_cast<int>(fd_), WSAGetLastError());
-        static_cast<IOEngineIocp*>(engine_)->release_context(ctx);
+                  static_cast<int>(fd_), cyrus_socket_error());
+        engine_->release_context(ctx);
         close();
         return;
     }
@@ -365,7 +396,7 @@ void Connection::send_sse_response(std::string_view full_response) {
     send_buffer_.set_length(full_response.size());
 
     // 投递异步 send
-    IOCPContext* ctx = static_cast<IOEngineIocp*>(engine_)->acquire_context();
+    IOContext* ctx = engine_->acquire_context();
     ctx->buffer = send_buffer_.data();
     ctx->bytes_transferred = send_buffer_.length();
     ctx->user_data = this;
@@ -373,8 +404,8 @@ void Connection::send_sse_response(std::string_view full_response) {
     int result = engine_->post_send(fd_, ctx);
     if (result != 0) {
         LOG_ERROR("Failed to post SSE send for fd {}: err={}",
-                  static_cast<int>(fd_), WSAGetLastError());
-        static_cast<IOEngineIocp*>(engine_)->release_context(ctx);
+                  static_cast<int>(fd_), cyrus_socket_error());
+        engine_->release_context(ctx);
         close();
         return;
     }
@@ -399,10 +430,20 @@ void Connection::transition_to_idle() {
 
         if (parser_.is_complete()) {
             // 流水线数据中已包含完整请求, 处理它
+            // 关键修复: 检查是否还有未消费字节 (可能是第三个请求)
+            // 先前直接 clear() 会丢弃 pending_data_ 中 req2+req3 的 req3 部分
             current_request_ = parser_.result();
             request_count_++;
             keep_alive_ = current_request_.keep_alive;
-            pending_data_.clear();
+            if (consumed < pending_data_.size()) {
+                // 保留未消费部分 (后续流水线请求)
+                LOG_DEBUG("Pipelining: {} bytes preserved after complete from pending (fd={})",
+                          pending_data_.size() - consumed, static_cast<int>(fd_));
+                pending_data_.erase(pending_data_.begin(),
+                                    pending_data_.begin() + consumed);
+            } else {
+                pending_data_.clear();
+            }
             handle_request();
             return;
         } else if (parser_.is_error()) {
@@ -425,6 +466,35 @@ void Connection::transition_to_idle() {
 }
 
 // ============================================================================
+// send_raw_sync() - 同步发送原始字节
+// ============================================================================
+// 用于 SSE 流式透传: worker 线程中 Router 同步阻塞 Agent recv,
+// 每收到一个 token 即通过此方法立即推送给客户端, 实现真正的流式响应。
+// 循环调用 ::send() 确保全部发送, 失败返回 false。
+bool Connection::send_raw_sync(const void* data, size_t len) {
+    if (fd_ == INVALID_SOCKET_VAL) return false;
+
+    const char* ptr = static_cast<const char*>(data);
+    size_t remaining = len;
+    while (remaining > 0) {
+        int sent = ::send(fd_, ptr, static_cast<int>(remaining), 0);
+        if (sent <= 0) {
+#ifdef _WIN32
+            int err = cyrus_socket_error();
+#else
+            int err = errno;
+#endif
+            LOG_ERROR("send_raw_sync failed: fd={}, sent={}, err={}",
+                      static_cast<int>(fd_), sent, err);
+            return false;
+        }
+        ptr += sent;
+        remaining -= static_cast<size_t>(sent);
+    }
+    return true;
+}
+
+// ============================================================================
 // close() - 关闭连接
 // ============================================================================
 void Connection::close() {
@@ -439,7 +509,7 @@ void Connection::close() {
     // 关闭 socket
     if (fd_ != INVALID_SOCKET_VAL) {
         // 优雅关闭: shutdown → 让对端知道我们将要断开
-        shutdown(fd_, SD_SEND);  // 半关闭 (发送方向)
+        shutdown(fd_, SHUT_WR);  // 半关闭 (发送方向)
         cyrus_close_socket(fd_);
         fd_ = INVALID_SOCKET_VAL;
     }

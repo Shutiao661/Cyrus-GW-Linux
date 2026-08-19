@@ -46,6 +46,7 @@ enum class IOOperation : uint8_t {
 struct IOContext {
     IOOperation  op = IOOperation::NONE;  // 操作类型
     socket_t     fd = INVALID_SOCKET_VAL; // 操作的套接字
+    socket_t     accept_fd = INVALID_SOCKET_VAL;  // Accept 完成: 新连接的 socket
     uint8_t*     buffer = nullptr;        // 数据缓冲区 (RECV: 接收缓冲区, SEND: 发送缓冲区)
     size_t       buffer_len = 0;          // 缓冲区大小
     size_t       bytes_transferred = 0;   // 完成时: 实际传输的字节数
@@ -56,6 +57,7 @@ struct IOContext {
     void reset() {
         op = IOOperation::NONE;
         fd = INVALID_SOCKET_VAL;
+        accept_fd = INVALID_SOCKET_VAL;
         buffer = nullptr;
         buffer_len = 0;
         bytes_transferred = 0;
@@ -122,6 +124,13 @@ public:
     // 向完成队列投递一个特殊的 "wakeup" 事件
     // 用于在 shutdown 时唤醒阻塞在 wait_completions() 上的工作线程
     virtual void post_wakeup() = 0;
+
+    // --- Context Pool (跨平台) ---
+    // 从对象池获取/归还 IOContext。具体实现由子类提供:
+    //   IOEngineIocp → IOCPContext 池
+    //   IOEngineUring → UringContext 池
+    virtual IOContext* acquire_context() = 0;
+    virtual void release_context(IOContext* ctx) = 0;
 };
 
 // ============================================================================

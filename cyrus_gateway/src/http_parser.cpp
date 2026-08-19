@@ -57,6 +57,9 @@ size_t HttpParser::parse(const uint8_t* data, size_t len) {
             case ParseState::CHUNK_DATA:
                 step_consumed = parse_chunk_data(data, len, consumed);
                 break;
+            case ParseState::CHUNK_TRAILER:
+                step_consumed = parse_chunk_trailer(data, len, consumed);
+                break;
             default:
                 return consumed;  // COMPLETE 或 ERROR
         }
@@ -83,6 +86,10 @@ size_t HttpParser::parse_method(const uint8_t* data, size_t len, size_t& consume
 
         if (c == ' ') {
             // 空格 → 方法解析完成
+            if (request_.method_str.empty()) {
+                set_error("empty HTTP method");
+                return 0;
+            }
             consumed++;  // 消耗空格
             request_.method = http_method_from_sv(request_.method_str);
             state_ = ParseState::PATH;
@@ -368,6 +375,10 @@ size_t HttpParser::parse_body(const uint8_t* data, size_t len, size_t& consumed)
     size_t consumed_before = consumed;
 
     while (consumed < len && body_bytes_read_ < content_length_) {
+        if (request_.body.size() > MAX_BODY_SIZE) {
+            set_error("request body too large");
+            return 0;
+        }
         request_.body.push_back(data[consumed]);
         consumed++;
         body_bytes_read_++;
@@ -396,11 +407,13 @@ size_t HttpParser::parse_chunk_size(const uint8_t* data, size_t len, size_t& con
                 consumed++;
                 // chunk 大小行结束
                 if (current_chunk_size_ == 0) {
-                    // 终止 chunk (0 大小) → 接下来可能有 trailer, 然后结束
-                    // 简化处理: 跳过 trailer, 直接完成
-                    // 检查后续是否是另一个 \r\n (trailer 结束)
-                    // 这里简单完成解析
-                    finalize_request();
+                    // 终止 chunk (0 大小) → 接下来必须有 trailer-part CRLF
+                    // RFC 7230: chunked-body = *chunk last-chunk trailer-part CRLF
+                    // trailer-part = *( header-field CRLF )
+                    // 关键修复: 不在此处 finalize, 改为过渡到 CHUNK_TRAILER 状态
+                    // 以消费 trailer header 行和终止空行 \r\n, 避免残留 \r\n
+                    // 进入 pending_data 导致 keep-alive 连接的下一个请求 400 错误
+                    state_ = ParseState::CHUNK_TRAILER;
                 } else {
                     // 开始接收 chunk 数据
                     state_ = ParseState::CHUNK_DATA;
@@ -478,6 +491,41 @@ size_t HttpParser::parse_chunk_data(const uint8_t* data, size_t len, size_t& con
         state_ = ParseState::CHUNK_SIZE;
     }
     return 1;
+}
+
+// ============================================================================
+// parse_chunk_trailer() - 消费 chunked trailer-part CRLF
+// ============================================================================
+// RFC 7230: trailer-part = *( header-field CRLF )
+// 在最后一个 chunk (0\r\n) 之后, 必须有一个 trailer-part 和 CRLF.
+// trailer-part 可以为空 (直接 \r\n) 或包含 trailer header 行.
+// 此函数跳过所有 trailer header 行, 直到遇到空行 (\r\n),
+// 然后调用 finalize_request() 完成解析.
+// 关键修复: 确保终止 \r\n 被消费, 不残留到 pending_data 导致后续请求错位.
+size_t HttpParser::parse_chunk_trailer(const uint8_t* data, size_t len, size_t& consumed) {
+    size_t consumed_before = consumed;
+    size_t line_start = consumed;  // 当前行起始位置, 用于检测空行
+
+    while (consumed < len) {
+        if (data[consumed] == '\r') {
+            if (consumed + 1 < len && data[consumed + 1] == '\n') {
+                consumed += 2;  // 消费 \r\n
+                if (consumed - line_start == 2) {
+                    // 空行 (\r\n 独立一行) → trailer 结束
+                    finalize_request();
+                    return consumed - consumed_before;
+                }
+                // 非空行 (trailer header), 继续扫描下一行
+                line_start = consumed;
+                continue;
+            }
+            // \r 在 buffer 末尾, 无法判断是否是 \r\n, 需要更多数据
+            return consumed - consumed_before;
+        }
+        // 跳过 trailer header 行中的字符 (header-name, ':', header-value 等)
+        consumed++;
+    }
+    return consumed - consumed_before;
 }
 
 // ============================================================================

@@ -1,0 +1,25 @@
+{
+  "config": {
+    "host": "127.0.0.1",
+    "port": 8080,
+    "path": "chat",
+    "clients": 100,
+    "duration_sec": 15
+  },
+  "results": {
+    "duration_ms": 5056.171,
+    "total_attempts": 0,
+    "successful": 0,
+    "failed": 0,
+    "completed_conns": 0,
+    "rps": 0.0,
+    "latency_us": {
+      "min": 0.000,
+      "avg": 0.000,
+      "max": 0.000,
+      "p50": 0.000,
+      "p95": 0.000,
+      "p99": 0.000
+    }
+  }
+}

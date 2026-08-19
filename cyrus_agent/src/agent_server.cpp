@@ -44,7 +44,7 @@ bool AgentServer::start() {
     // --- 第 1 步: 创建监听 socket ---
     listen_fd_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listen_fd_ == INVALID_SOCKET_VAL) {
-        LOG_ERROR("AgentServer: socket() failed: {}", WSAGetLastError());
+        LOG_ERROR("AgentServer: socket() failed: {}", cyrus_socket_error());
         return false;
     }
 
@@ -59,19 +59,19 @@ bool AgentServer::start() {
     // --- 第 2 步: Bind ---
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1");  // 仅本地
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);  // 仅本地
     addr.sin_port = htons(port_);
 
-    if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
-        LOG_ERROR("AgentServer: bind to port {} failed: {}", port_, WSAGetLastError());
+    if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR_VAL) {
+        LOG_ERROR("AgentServer: bind to port {} failed: {}", port_, cyrus_socket_error());
         cyrus_close_socket(listen_fd_);
         listen_fd_ = INVALID_SOCKET_VAL;
         return false;
     }
 
     // --- 第 3 步: Listen ---
-    if (listen(listen_fd_, SOMAXCONN) == SOCKET_ERROR) {
-        LOG_ERROR("AgentServer: listen failed: {}", WSAGetLastError());
+    if (listen(listen_fd_, SOMAXCONN) == SOCKET_ERROR_VAL) {
+        LOG_ERROR("AgentServer: listen failed: {}", cyrus_socket_error());
         cyrus_close_socket(listen_fd_);
         listen_fd_ = INVALID_SOCKET_VAL;
         return false;
@@ -159,8 +159,8 @@ void AgentServer::event_loop() {
 
         if (ready < 0) {
             if (!running_) break;
-            int err = WSAGetLastError();
-            if (err != WSAEINTR) {
+            int err = cyrus_socket_error();
+            if (err != CYRUS_EINTR) {
                 LOG_ERROR("AgentServer: select error: {}", err);
             }
             continue;
@@ -178,15 +178,16 @@ void AgentServer::event_loop() {
 
         // --- 检查客户端 socket (数据到达) ---
         if (ready > 0) {
-            std::lock_guard<std::mutex> lock(clients_mutex_);
-            // 收集需要处理的 fd (迭代时不修改 map)
+            // 收集需要处理的 fd (在锁内读取, 在锁外处理)
             std::vector<socket_t> ready_fds;
-            for (const auto& [fd, state] : clients_) {
-                if (FD_ISSET(fd, &read_fds)) {
-                    ready_fds.push_back(fd);
+            {
+                std::lock_guard<std::mutex> lock(clients_mutex_);
+                for (const auto& [fd, state] : clients_) {
+                    if (FD_ISSET(fd, &read_fds)) {
+                        ready_fds.push_back(fd);
+                    }
                 }
-            }
-            // 在锁外处理
+            } // 释放锁 — handle_client_data() 内部会再次获取 clients_mutex_
             for (socket_t fd : ready_fds) {
                 handle_client_data(fd);
             }
@@ -201,15 +202,15 @@ void AgentServer::event_loop() {
 // ============================================================================
 void AgentServer::handle_new_connection() {
     sockaddr_in client_addr{};
-    int addr_len = sizeof(client_addr);
+    socklen_t addr_len = sizeof(client_addr);
 
     socket_t client_fd = accept(listen_fd_,
                                  reinterpret_cast<sockaddr*>(&client_addr),
                                  &addr_len);
 
     if (client_fd == INVALID_SOCKET_VAL) {
-        int err = WSAGetLastError();
-        if (err != WSAEWOULDBLOCK && running_) {
+        int err = cyrus_socket_error();
+        if (err != CYRUS_EWOULDBLOCK && running_) {
             LOG_ERROR("AgentServer: accept failed: {}", err);
         }
         return;
@@ -242,8 +243,8 @@ void AgentServer::handle_client_data(socket_t client_fd) {
         if (bytes_read == 0) {
             LOG_DEBUG("AgentServer: client fd={} disconnected", static_cast<int>(client_fd));
         } else {
-            int err = WSAGetLastError();
-            if (err != WSAEWOULDBLOCK) {
+            int err = cyrus_socket_error();
+            if (err != CYRUS_EWOULDBLOCK) {
                 LOG_WARN("AgentServer: recv error on fd={}: {}", static_cast<int>(client_fd), err);
             } else {
                 return;  // 无数据, 不是错误
@@ -391,7 +392,7 @@ void AgentServer::process_request_on_connection(
 
         if (send(client_fd,
                  reinterpret_cast<const char*>(headers_frame.data()),
-                 static_cast<int>(headers_frame.size()), 0) == SOCKET_ERROR) {
+                 static_cast<int>(headers_frame.size()), 0) == SOCKET_ERROR_VAL) {
             LOG_WARN("AgentServer: failed to send response headers to fd={}", static_cast<int>(client_fd));
             goto cleanup_client;
         }
@@ -405,7 +406,7 @@ void AgentServer::process_request_on_connection(
                 is_last);
             if (send(client_fd,
                      reinterpret_cast<const char*>(data_frame.data()),
-                     static_cast<int>(data_frame.size()), 0) == SOCKET_ERROR) {
+                     static_cast<int>(data_frame.size()), 0) == SOCKET_ERROR_VAL) {
                 LOG_WARN("AgentServer: failed to send data chunk {}/{} to fd={}",
                          i + 1, resp.stream_chunks.size(), static_cast<int>(client_fd));
                 goto cleanup_client;
@@ -426,7 +427,7 @@ void AgentServer::process_request_on_connection(
 
         if (send(client_fd,
                  reinterpret_cast<const char*>(headers_frame.data()),
-                 static_cast<int>(headers_frame.size()), 0) == SOCKET_ERROR) {
+                 static_cast<int>(headers_frame.size()), 0) == SOCKET_ERROR_VAL) {
             LOG_WARN("AgentServer: failed to send response headers to fd={}", static_cast<int>(client_fd));
             goto cleanup_client;
         }

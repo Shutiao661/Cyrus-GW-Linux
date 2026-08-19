@@ -17,6 +17,7 @@
 #include "cyrus/agent/agent_server.hpp"
 #include "cyrus/agent/echo_handler.hpp"
 #include "cyrus/agent/chat_handler.hpp"
+#include "cyrus/agent/deepseek_provider.hpp"
 #include "cyrus/logger.hpp"
 
 #include <string>
@@ -44,7 +45,11 @@ int main(int argc, char* argv[]) {
 
     LOG_INFO("============================================");
     LOG_INFO("  Cyrus Agent v1.0.0");
+#if CYRUS_PLATFORM_WINDOWS
     LOG_INFO("  Platform: Windows");
+#else
+    LOG_INFO("  Platform: Linux");
+#endif
     LOG_INFO("============================================");
 
     // ========================================================================
@@ -66,8 +71,18 @@ int main(int argc, char* argv[]) {
 
     // 注册请求处理器
     server.register_handler("/echo", std::make_unique<EchoHandler>());
-    server.register_handler("/v1/chat/completions", std::make_unique<ChatHandler>());
-    server.register_handler("/v1/chat", std::make_unique<ChatHandler>());
+
+    // DeepSeek API: 真实 LLM 调用
+    auto deepseek = std::make_unique<DeepSeekProvider>(
+        "sk-6934564b14fd4a8196bfbbdcb8b83686",  // API key
+        "deepseek-chat"                           // model
+    );
+    server.register_handler("/v1/chat/completions",
+        std::make_unique<ChatHandler>(std::move(deepseek)));
+    server.register_handler("/v1/chat",
+        std::make_unique<ChatHandler>(
+            std::make_unique<DeepSeekProvider>(
+                "sk-6934564b14fd4a8196bfbbdcb8b83686", "deepseek-chat")));
 
     // ========================================================================
     // 第 6 步: 启动服务器

@@ -197,9 +197,9 @@
 // 但在运行时会返回错误 —— 实际使用 IOEngineIocp 替代
 // 如果强行在 Windows 上运行 io_uring 代码, 会得到清晰的 "not supported" 错误
 
-#if !CYRUS_PLATFORM_LINUX
+#if !CYRUS_HAS_LIBURING
 
-// io_uring 核心结构体 (存根, 只用于编译)
+// io_uring 核心结构体 (存根, 只用于编译 — liburing 不可用)
 struct io_uring {
     int ring_fd = -1;
 };
@@ -331,7 +331,7 @@ inline void io_uring_prep_nop(io_uring_sqe*) {}
 inline void io_uring_prep_close(io_uring_sqe*, int) {}
 inline void io_uring_prep_read(io_uring_sqe*, int, void*, unsigned, off_t) {}
 
-#endif // !CYRUS_PLATFORM_LINUX
+#endif // !CYRUS_HAS_LIBURING
 
 // ============================================================================
 // 第 7 部分: WSA 初始化/清理 (Windows RAII 封装, Linux 空操作)

@@ -20,8 +20,19 @@ target_include_directories(cyrus_gateway PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
-# 链接 cyrus_common (也会自动链接 Winsock2)
+# 链接 cyrus_common (也会自动链接 Winsock2 / pthread)
 target_link_libraries(cyrus_gateway PRIVATE cyrus_common)
+
+# Linux: 尝试链接 liburing (可选, 用于 io_uring 引擎)
+if(NOT WIN32)
+    find_library(LIBURING_LIB uring)
+    if(LIBURING_LIB)
+        target_link_libraries(cyrus_gateway PRIVATE ${LIBURING_LIB})
+        message(STATUS "Found liburing: ${LIBURING_LIB}")
+    else()
+        message(STATUS "liburing not found — io_uring engine will use fallback")
+    endif()
+endif()
 
 # 编译器警告
 set_compiler_warnings(cyrus_gateway)

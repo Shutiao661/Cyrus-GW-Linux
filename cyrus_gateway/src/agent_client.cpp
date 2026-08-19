@@ -22,7 +22,7 @@ bool AgentClient::connect(const std::string& host, int port) {
     // 创建 TCP socket
     fd_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (fd_ == INVALID_SOCKET_VAL) {
-        LOG_ERROR("AgentClient: socket() failed: {}", WSAGetLastError());
+        LOG_ERROR("AgentClient: socket() failed: {}", cyrus_socket_error());
         return false;
     }
 
@@ -37,9 +37,9 @@ bool AgentClient::connect(const std::string& host, int port) {
     }
 
     // 连接到服务器
-    if (::connect(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
+    if (::connect(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR_VAL) {
         LOG_ERROR("AgentClient: connect to {}:{} failed: {}",
-                  host, port, WSAGetLastError());
+                  host, port, cyrus_socket_error());
         disconnect();
         return false;
     }
@@ -74,8 +74,8 @@ bool AgentClient::send_packet(const std::vector<uint8_t>& data) {
                         static_cast<int>(data.size()),
                         0);  // 无特殊标志
 
-    if (result == SOCKET_ERROR) {
-        LOG_ERROR("AgentClient: send failed: {}", WSAGetLastError());
+    if (result == SOCKET_ERROR_VAL) {
+        LOG_ERROR("AgentClient: send failed: {}", cyrus_socket_error());
         return false;
     }
 
@@ -98,9 +98,16 @@ bool AgentClient::recv_packet(std::vector<uint8_t>& out_frame, int timeout_ms) {
     }
 
     // --- 设置接收超时 ---
+#ifdef _WIN32
     DWORD timeout = static_cast<DWORD>(timeout_ms);
     setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO,
                reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+#else
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
 
     // --- 第 1 步: 读取 4 字节长度前缀 ---
     uint32_t payload_len_net = 0;
@@ -112,9 +119,9 @@ bool AgentClient::recv_packet(std::vector<uint8_t>& out_frame, int timeout_ms) {
     if (result != sizeof(uint32_t)) {
         if (result == 0) {
             LOG_DEBUG("AgentClient: Agent closed connection");
-        } else if (result == SOCKET_ERROR) {
-            int err = WSAGetLastError();
-            if (err != WSAETIMEDOUT) {
+        } else if (result == SOCKET_ERROR_VAL) {
+            int err = cyrus_socket_error();
+            if (err != CYRUS_EWOULDBLOCK && err != CYRUS_EINTR) {
                 LOG_ERROR("AgentClient: recv header failed: {}", err);
             }
         }

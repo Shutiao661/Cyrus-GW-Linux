@@ -21,7 +21,6 @@
 #include "cyrus/buffer_pool.hpp"
 #include "cyrus/token_bucket.hpp"
 #include "io_engine.hpp"
-#include "io_engine_iocp.hpp"
 #include "connection.hpp"
 #include "router.hpp"
 
@@ -71,7 +70,7 @@ private:
     bool post_accept();
 
     // Accept 完成回调
-    void on_accept_complete(IOCPContext* ctx);
+    void on_accept_complete(IOContext* ctx);
 
     // 工作线程主函数 (事件循环)
     void worker_loop(int worker_id);

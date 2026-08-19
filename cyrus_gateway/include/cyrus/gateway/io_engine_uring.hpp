@@ -25,10 +25,12 @@
 #include "io_engine.hpp"
 #include "cyrus/logger.hpp"
 
-#ifdef __linux__
-#include <liburing.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <deque>
+#include <condition_variable>
+#if CYRUS_HAS_LIBURING
+#include <liburing.h>
 #endif
 
 namespace cyrus {
@@ -79,12 +81,28 @@ public:
 
     void post_wakeup() override;
 
+    IOContext* acquire_context() override;
+    void release_context(IOContext* ctx) override;
+
 private:
-#ifdef __linux__
-    struct io_uring ring_;
     bool initialized_ = false;
+#if CYRUS_HAS_LIBURING
+    struct io_uring ring_;
 #endif
     std::atomic<bool> shutting_down_{false};
+
+    // UringContext 对象池
+    std::vector<std::unique_ptr<UringContext>> context_pool_;
+    std::vector<UringContext*> free_contexts_;
+    std::mutex pool_mutex_;
+
+    // POSIX fallback (CYRUS_HAS_LIBURING=0 时使用)
+    std::thread accept_thread_;
+    bool accept_thread_running_ = false;
+    socket_t listen_fd_ = INVALID_SOCKET_VAL;
+    std::deque<IOContext*> completion_queue_;
+    std::mutex completion_mutex_;
+    std::condition_variable completion_cv_;
 };
 
 } // namespace gateway

@@ -1,0 +1,25 @@
+{
+  "config": {
+    "host": "127.0.0.1",
+    "port": 8080,
+    "path": "health",
+    "clients": 500,
+    "duration_sec": 10
+  },
+  "results": {
+    "duration_ms": 245.438,
+    "total_attempts": 2743,
+    "successful": 2243,
+    "failed": 500,
+    "completed_conns": 500,
+    "rps": 9138.8,
+    "latency_us": {
+      "min": 450.800,
+      "avg": 34288.147,
+      "max": 46691.700,
+      "p50": 35608.200,
+      "p95": 43711.500,
+      "p99": 44319.800
+    }
+  }
+}
