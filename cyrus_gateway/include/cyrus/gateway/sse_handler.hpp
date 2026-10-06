@@ -27,7 +27,13 @@
 #include <cstring>
 
 namespace cyrus {
-namespace gateway {
+
+
+
+
+
+
+    namespace gateway {
 
 // ============================================================================
 // SSEEvent - SSE 解析事件
@@ -71,8 +77,11 @@ struct SSERelayTimeout {
 
     static SSERelayTimeout from_config(const Config& config) {
         SSERelayTimeout t;
+        // 总预算: [sse] total_timeout_ms 优先; 未配置时回落到
+        // [agent] request_timeout_ms (即"一次 Agent 请求的整体预算")
+        int default_total = config.get_int("agent", "request_timeout_ms", 120000);
         t.first_byte_timeout_ms = config.get_int("sse", "first_byte_timeout_ms", 15000);
-        t.total_timeout_ms      = config.get_int("sse", "total_timeout_ms", 120000);
+        t.total_timeout_ms      = config.get_int("sse", "total_timeout_ms", default_total);
         t.idle_timeout_ms       = config.get_int("sse", "idle_timeout_ms", 30000);
         return t;
     }

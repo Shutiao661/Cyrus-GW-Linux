@@ -38,14 +38,31 @@ public:
     // 连接到 Agent 服务器
     // host: 服务器地址 (如 "127.0.0.1")
     // port: 服务器端口 (如 9999)
+    // timeout_ms: 连接超时 (来自 [agent] connect_timeout_ms), <=0 表示无限等待
     // 返回 true 表示连接成功
-    bool connect(const std::string& host, int port);
+    bool connect(const std::string& host, int port, int timeout_ms = 5000);
 
     // 断开连接
     void disconnect();
 
     // 是否已连接
     bool is_connected() const noexcept { return fd_ != INVALID_SOCKET_VAL; }
+
+    // 对端是否已关闭 (探活)。
+    // Agent 采用"每连接一个请求-响应周期"的模型, 处理完就关闭连接, 而 TCP
+    // 半关闭在本地 fd 上看不出来 —— 只查 is_connected() 会把死连接反复派发
+    // 出去, 池子轮过一圈后每个请求都失败。用 MSG_PEEK 非阻塞探测:
+    // 不消费数据, 返回 0 表示对端已发 FIN。
+    bool peer_closed() const {
+        if (fd_ == INVALID_SOCKET_VAL) return true;
+        char c = 0;
+        ssize_t n = ::recv(fd_, &c, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (n == 0) return true;                       // 对端已关闭
+        if (n < 0) {
+            return !(errno == EAGAIN || errno == EWOULDBLOCK);  // 无数据可读=正常
+        }
+        return false;                                  // 有数据可读 = 存活
+    }
 
     // --- 忙标记 (并发独占) ---
     // 一个 AgentClient 的底层 socket 是串行协议, 同一时刻只能服务一个流式请求。

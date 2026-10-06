@@ -5,6 +5,8 @@
 #include "cyrus/gateway/agent_client.hpp"
 #include "cyrus/logger.hpp"
 
+#include <poll.h>  // 非阻塞 connect 等待可写
+
 namespace cyrus {
 namespace gateway {
 
@@ -15,7 +17,7 @@ AgentClient::~AgentClient() {
 // ============================================================================
 // connect() - 连接到 Agent 服务器
 // ============================================================================
-bool AgentClient::connect(const std::string& host, int port) {
+bool AgentClient::connect(const std::string& host, int port, int timeout_ms) {
     host_ = host;
     port_ = port;
 
@@ -36,12 +38,48 @@ bool AgentClient::connect(const std::string& host, int port) {
         return false;
     }
 
-    // 连接到服务器
-    if (::connect(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR_VAL) {
-        LOG_ERROR("AgentClient: connect to {}:{} failed: {}",
-                  host, port, cyrus_socket_error());
+    // 非阻塞 connect + poll 超时: 对端不可达时 (防火墙丢包等) connect 可能
+    // 阻塞很久, 而调用方是 worker / 中继线程, 不能被它拖住。
+    int flags = ::fcntl(fd_, F_GETFL, 0);
+    if (flags != -1) {
+        ::fcntl(fd_, F_SETFL, flags | O_NONBLOCK);
+    }
+
+    int rc = ::connect(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    if (rc != 0 && errno != EINPROGRESS) {
+        LOG_ERROR("AgentClient: connect to {}:{} failed: {}", host, port, cyrus_socket_error());
         disconnect();
         return false;
+    }
+
+    if (rc != 0) {
+        // 等待可写 (= 连接建立或失败)
+        struct pollfd pfd{};
+        pfd.fd = fd_;
+        pfd.events = POLLOUT;
+        int pr = ::poll(&pfd, 1, timeout_ms > 0 ? timeout_ms : -1);
+        if (pr == 0) {
+            LOG_ERROR("AgentClient: connect to {}:{} timed out ({}ms)", host, port, timeout_ms);
+            disconnect();
+            return false;
+        }
+        if (pr < 0) {
+            LOG_ERROR("AgentClient: connect poll failed: {}", cyrus_socket_error());
+            disconnect();
+            return false;
+        }
+        int so_err = 0;
+        socklen_t len = sizeof(so_err);
+        if (::getsockopt(fd_, SOL_SOCKET, SO_ERROR, &so_err, &len) != 0 || so_err != 0) {
+            LOG_ERROR("AgentClient: connect to {}:{} failed: {}", host, port, so_err);
+            disconnect();
+            return false;
+        }
+    }
+
+    // 恢复阻塞模式: 后续 recv 依赖 MSG_WAITALL + SO_RCVTIMEO
+    if (flags != -1) {
+        ::fcntl(fd_, F_SETFL, flags);
     }
 
     LOG_DEBUG("AgentClient: connected to {}:{}", host, port);
@@ -83,10 +121,12 @@ bool AgentClient::send_packet(const std::vector<uint8_t>& data) {
                 continue;  // 被信号中断, 重试
             }
             LOG_ERROR("AgentClient: send failed: {}", err);
+            disconnect();  // 标记断开, 连接池下次 acquire 时重连
             return false;
         }
         if (n == 0) {
             LOG_ERROR("AgentClient: send returned 0 (connection closed)");
+            disconnect();
             return false;
         }
         sent_total += static_cast<size_t>(n);
@@ -120,12 +160,18 @@ bool AgentClient::recv_packet(std::vector<uint8_t>& out_frame, int timeout_ms) {
 
     if (result != sizeof(uint32_t)) {
         if (result == 0) {
+            // 对端已关闭。Agent 是"每连接一个请求-响应周期"的模型, 处理完就关,
+            // 因此这里必须标记断开 —— 否则这个 fd 仍是"有效"的, 连接池会把它
+            // 反复派发出去, 池子轮过一圈后每个请求都会失败。
             LOG_DEBUG("AgentClient: Agent closed connection");
+            disconnect();
         } else if (result == SOCKET_ERROR_VAL) {
             int err = cyrus_socket_error();
-            if (err != CYRUS_EWOULDBLOCK && err != CYRUS_EINTR) {
-                LOG_ERROR("AgentClient: recv header failed: {}", err);
+            if (err == CYRUS_EWOULDBLOCK || err == CYRUS_EINTR) {
+                return false;  // 收包超时/被信号打断: 连接仍然可用, 不标记断开
             }
+            LOG_ERROR("AgentClient: recv header failed: {}", err);
+            disconnect();
         }
         return false;
     }
@@ -148,6 +194,7 @@ bool AgentClient::recv_packet(std::vector<uint8_t>& out_frame, int timeout_ms) {
     if (result != static_cast<int>(payload_len)) {
         LOG_ERROR("AgentClient: recv payload failed: expected {}, got {}",
                   payload_len, result);
+        disconnect();  // 帧读了一半, 连接已不可复用
         return false;
     }
 

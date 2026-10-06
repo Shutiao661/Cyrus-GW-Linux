@@ -75,6 +75,12 @@ void IOEngineUring::shutdown() {
             ::shutdown(listen_fd_, SHUT_RDWR);
             ::close(listen_fd_);
             listen_fd_ = INVALID_SOCKET_VAL;
+        } else if (accept_thread_running_) {
+            // 不应发生: accept 线程还在跑却丢了监听 fd, 此时无法唤醒它,
+            // join 会永久挂起 (只能 SIGKILL)。post_accept() 的守卫保证
+            // listen_fd_ 不会被无效值覆盖, 这里留作回归哨兵。
+            LOG_ERROR("accept thread still running but listen fd is invalid; "
+                      "shutdown may hang");
         }
         accept_thread_.join();
     }
@@ -108,8 +114,12 @@ bool IOEngineUring::register_socket(socket_t fd, void* user_data) {
 // post_accept() - 投递 Accept
 // ============================================================================
 int IOEngineUring::post_accept(socket_t listen_fd, IOContext* base_ctx) {
-    // 记录监听 socket (shutdown 时由引擎统一关闭, io_uring/POSIX 两种模式都需)
-    listen_fd_ = listen_fd;
+    // 记录监听 socket (shutdown 时由引擎统一关闭, io_uring/POSIX 两种模式都需)。
+    // 只接受有效 fd: 无条件的赋值会被关闭流程中的 post_accept(INVALID) 覆盖成
+    // -1, 使 shutdown() 跳过关闭监听 socket 的分支, accept 线程永远无法 join。
+    if (listen_fd != INVALID_SOCKET_VAL) {
+        listen_fd_ = listen_fd;
+    }
 
 #if CYRUS_HAS_LIBURING
     UringContext* ctx = static_cast<UringContext*>(base_ctx);

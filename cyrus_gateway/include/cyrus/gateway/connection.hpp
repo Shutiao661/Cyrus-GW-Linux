@@ -24,6 +24,7 @@
 
 #include <memory>
 #include <chrono>
+#include <atomic>
 
 namespace cyrus {
 namespace gateway {
@@ -57,7 +58,9 @@ public:
 
     Connection(socket_t fd, IOEngine* engine, BufferPool* pool,
                Router* router = nullptr, RateLimiter* rate_limiter = nullptr,
-               std::string client_ip = "");
+               std::string client_ip = "",
+               size_t max_keepalive_requests = MAX_KEEPALIVE_REQUESTS,
+               size_t max_header_size = HttpParser::MAX_HEADER_SIZE);
     ~Connection();
 
     // 禁止拷贝 (socket 所有权唯一)
@@ -66,6 +69,17 @@ public:
 
     // --- 状态查询 ---
     socket_t fd() const noexcept { return fd_; }
+    bool is_closed() const noexcept { return fd_ == INVALID_SOCKET_VAL; }
+
+    // 空闲时长 (毫秒, 自最后一次收发算起) — keep-alive 超时扫描用
+    int64_t idle_ms() const;
+
+    // --- SSE 中继标记 ---
+    // 中继线程持有此连接期间为 true。worker 与空闲扫描线程据此跳过
+    // 正在被中继使用的连接, 避免销毁仍被引用的对象 (use-after-free)。
+    void mark_streaming() noexcept { streaming_.store(true, std::memory_order_release); }
+    void unmark_streaming() noexcept { streaming_.store(false, std::memory_order_release); }
+    bool is_streaming() const noexcept { return streaming_.load(std::memory_order_acquire); }
 
     // --- 事件处理 (由 Server/IOEngine 完成循环调用) ---
     void on_accept_complete();       // Accept 完成 → 投递第一个 recv
@@ -126,6 +140,10 @@ private:
     // keep-alive 管理
     bool keep_alive_ = true;                     // 当前请求是否 keep-alive
     size_t request_count_ = 0;                   // 此连接上已处理的请求数
+    size_t max_keepalive_requests_ = MAX_KEEPALIVE_REQUESTS;  // 来自配置
+
+    // SSE 中继占用标记 (跨线程访问)
+    std::atomic<bool> streaming_{false};
 
     // 时间戳 (用于超时管理)
     std::chrono::steady_clock::time_point last_activity_;

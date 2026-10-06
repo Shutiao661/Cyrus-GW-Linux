@@ -25,7 +25,7 @@ size_t HttpParser::parse(const uint8_t* data, size_t len) {
     // 返回值仅表示是否取得了进展 (0 = 需要更多数据或出错, >0 = 已处理数据)
     while (consumed < len) {
         // 检查大小限制
-        if (total_bytes_parsed_ > MAX_HEADER_SIZE + MAX_BODY_SIZE) {
+        if (total_bytes_parsed_ > max_header_size_ + MAX_BODY_SIZE) {
             set_error("request too large");
             return consumed;
         }
@@ -233,7 +233,7 @@ size_t HttpParser::parse_header_name(const uint8_t* data, size_t len, size_t& co
         }
 
         total_header_size_++;
-        if (total_header_size_ > MAX_HEADER_SIZE) {
+        if (total_header_size_ > max_header_size_) {
             set_error("headers too large");
             return 0;
         }
@@ -272,7 +272,7 @@ size_t HttpParser::parse_header_value(const uint8_t* data, size_t len, size_t& c
         consumed++;
 
         total_header_size_++;
-        if (total_header_size_ > MAX_HEADER_SIZE) {
+        if (total_header_size_ > max_header_size_) {
             set_error("headers too large");
             return 0;
         }

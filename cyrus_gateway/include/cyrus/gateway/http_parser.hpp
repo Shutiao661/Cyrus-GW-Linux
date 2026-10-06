@@ -142,6 +142,11 @@ public:
     static constexpr size_t MAX_HEADERS       = 64;       // 最大头部数量
     static constexpr size_t MAX_BODY_SIZE     = 1048576;  // 最大请求体大小 (1MB)
 
+    // 覆盖最大头部总大小 (来自配置 [connection] max_header_size)
+    void set_max_header_size(size_t n) noexcept {
+        if (n > 0) max_header_size_ = n;
+    }
+
     // --- 返回值: 消耗的字节数 ---
     // parse() 返回成功解析的字节数。
     // 返回 0 且 state() == ERROR 表示解析错误。
@@ -247,6 +252,7 @@ private:
     // 已解析的总字节数 (用于防止过大请求)
     size_t total_bytes_parsed_ = 0;
     size_t total_header_size_ = 0;      // 头部区域总大小
+    size_t max_header_size_ = MAX_HEADER_SIZE;  // 可配置 (set_max_header_size)
 
     // 设置错误状态
     void set_error(const char* reason) {

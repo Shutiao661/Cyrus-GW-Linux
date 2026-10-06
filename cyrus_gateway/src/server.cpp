@@ -18,6 +18,15 @@ Server::Server(const Config& config) : config_(config) {
     listen_port_    = static_cast<uint16_t>(config_.get_int("server", "listen_port", 8080));
     worker_count_   = config_.get_int("server", "worker_threads", 0);
 
+    max_connections_ = static_cast<size_t>(
+        config_.get_int("connection", "max_connections", 10000));
+    keepalive_timeout_ms_ = static_cast<int64_t>(
+        config_.get_int("connection", "keepalive_timeout_s", 5)) * 1000;
+    max_keepalive_requests_ = static_cast<size_t>(
+        config_.get_int("connection", "max_keepalive_requests", 1000));
+    max_header_size_ = static_cast<size_t>(
+        config_.get_int("connection", "max_header_size", 8192));
+
     // 如果没有配置工作线程数, 使用 CPU 核心数
     if (worker_count_ <= 0) {
         worker_count_ = static_cast<int>(std::thread::hardware_concurrency());
@@ -67,6 +76,8 @@ bool Server::start() {
     if (!router_->init()) {
         LOG_WARN("Router: agent backend may not be available (non-fatal)");
     }
+    // 流式连接在中继结束后由中继线程摘除 (它是这条连接的最后使用者)
+    router_->set_connection_reaper([this](socket_t fd) { remove_connection(fd); });
 
     // --- 第 5 步: 创建监听 socket ---
     if (!create_listen_socket()) {
@@ -94,6 +105,9 @@ bool Server::start() {
         worker_threads_.emplace_back(&Server::worker_loop, this, i);
     }
     LOG_INFO("Started {} worker threads", worker_count_);
+
+    // --- 第 9 步: 启动空闲连接回收线程 ---
+    sweeper_thread_ = std::thread(&Server::sweeper_loop, this);
 
     started_ = true;
     LOG_INFO("🚀 Cyrus-GW Gateway listening on {}:{}",
@@ -143,7 +157,8 @@ void Server::stop() {
 
     // --- 第 3 步: 关闭所有客户端 socket (仅关 fd, 对象暂不销毁) ---
     // 关键: POSIX fallback 下 worker 线程阻塞在同步 ::recv 上, 若不先关闭 socket,
-    // join 会永久阻塞 (死锁)。close(fd) 会解除 ::recv 的阻塞 (返回 EBADF)。
+    // join 会永久阻塞 (死锁)。Connection::close() 用 shutdown(SHUT_RDWR)
+    // 让阻塞中的 ::recv 立即返回 (仅 SHUT_WR 或 close(fd) 都唤不醒)。
     {
         std::lock_guard<std::mutex> lock(connections_mutex_);
         for (auto& [fd, conn] : connections_) {
@@ -161,6 +176,11 @@ void Server::stop() {
         }
     }
     worker_threads_.clear();
+
+    // --- 第 5.5 步: 停止空闲连接回收线程 (必须在销毁连接对象之前) ---
+    if (sweeper_thread_.joinable()) {
+        sweeper_thread_.join();
+    }
     LOG_INFO("All worker threads stopped");
 
     // --- 第 6 步: 销毁连接对象 (worker 已全部退出, 无 use-after-free) ---
@@ -234,6 +254,14 @@ bool Server::create_listen_socket() {
 // post_accept() - 投递异步 Accept
 // ============================================================================
 bool Server::post_accept() {
+    // 关闭流程中 listen_fd_ 已被置为无效: 不能再投递 accept。
+    // 若把无效 fd 传下去, 引擎侧的 listen_fd_ 会被覆盖成 -1, 导致
+    // shutdown() 跳过"关闭监听 socket"分支, accept 线程永远卡在 accept()
+    // 上无法 join (关机永久挂起)。
+    if (listen_fd_ == INVALID_SOCKET_VAL) {
+        return false;
+    }
+
     IOContext* ctx = engine_->acquire_context();
     ctx->user_data = nullptr;  // 标记为 Accept 操作 (worker_loop 用于区分)
 
@@ -276,10 +304,18 @@ void Server::worker_loop(int worker_id) {
                     // user_data 指向 Connection 对象
                     Connection* conn = static_cast<Connection*>(ctx->user_data);
                     if (conn) {
+                        // 每个连接同一时刻只有一个挂起的操作, 因此本线程
+                        // 处理完这个完成事件后即成为该连接的最后使用者
+                        socket_t conn_fd = ctx->fd;
                         if (ctx->op == IOOperation::RECV) {
                             conn->on_recv_complete(ctx);
                         } else {
                             conn->on_send_complete(ctx);
+                        }
+                        // 已关闭且无中继线程持有 → 摘除并销毁 (修复连接对象泄漏)。
+                        // remove_connection 之后不得再访问 conn。
+                        if (conn->is_closed() && !conn->is_streaming()) {
+                            remove_connection(conn_fd);
                         }
                     }
                     break;
@@ -313,35 +349,47 @@ void Server::on_accept_complete(IOContext* ctx) {
 
     socket_t client_fd = ctx->accept_fd;
 
-    // --- 第 1 步: 设置非阻塞 ---
+    // --- 第 1 步: 连接数上限 (防雪崩: 超限直接拒绝, 不建立 Connection) ---
+    if (at_connection_limit()) {
+        LOG_WARN("Max connections reached ({}), rejecting fd={}",
+                 max_connections_, static_cast<int>(client_fd));
+        cyrus_close_socket(client_fd);
+        engine_->release_context(ctx);
+        if (g_running.load(std::memory_order_acquire)) {
+            post_accept();
+        }
+        return;
+    }
+
+    // --- 第 2 步: 设置非阻塞 + 禁用 Nagle (低延迟响应) ---
     cyrus_set_nonblocking(client_fd);
 
-    // --- 第 2 步: 禁用 Nagle 算法 (低延迟响应) ---
     int nodelay = 1;
     setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY,
                reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
 
-    // --- 第 2.5 步: 提取客户端 IP (per-IP 限流用) ---
+    // --- 第 3 步: 提取客户端 IP (per-IP 限流用) ---
     std::string client_ip;
     char ipbuf[INET_ADDRSTRLEN] = {0};
     if (inet_ntop(AF_INET, &ctx->accept_addr.sin_addr, ipbuf, sizeof(ipbuf)) != nullptr) {
         client_ip = ipbuf;
     }
 
-    // --- 第 3 步: 创建 Connection 对象 ---
+    // --- 第 4 步: 创建 Connection 对象 (带上配置的连接级上限) ---
     auto conn = std::make_unique<Connection>(
         client_fd, engine_.get(), pool_.get(),
-        router_.get(), rate_limiter_.get(), client_ip);
+        router_.get(), rate_limiter_.get(), client_ip,
+        max_keepalive_requests_, max_header_size_);
 
-    // --- 第 4 步: 启动连接 (注册到引擎 + 投递第一个 recv) ---
+    // --- 第 5 步: 启动连接 (注册到引擎 + 投递第一个 recv) ---
     Connection* conn_ptr = conn.get();
     add_connection(client_fd, std::move(conn));
     conn_ptr->on_accept_complete();
 
-    // --- 第 5 步: 归还 Accept 上下文 ---
+    // --- 第 6 步: 归还 Accept 上下文 ---
     engine_->release_context(ctx);
 
-    // --- 第 6 步: 重新投递 Accept (保持多个 accept 在队列中) ---
+    // --- 第 7 步: 重新投递 Accept (保持多个 accept 在队列中) ---
     post_accept();
 }
 
@@ -351,6 +399,61 @@ void Server::on_accept_complete(IOContext* ctx) {
 void Server::add_connection(socket_t fd, std::unique_ptr<Connection> conn) {
     std::lock_guard<std::mutex> lock(connections_mutex_);
     connections_[fd] = std::move(conn);
+}
+
+// 摘除并销毁连接。只允许"最后使用者"调用:
+//   - 处理完该连接完成事件的 worker 线程
+//   - 持有该连接的 SSE 中继线程 (排空时保证已 join)
+void Server::remove_connection(socket_t fd) {
+    std::lock_guard<std::mutex> lock(connections_mutex_);
+    size_t erased = connections_.erase(fd);
+    LOG_DEBUG("Connection removed: fd={}, active={}", static_cast<int>(fd),
+              connections_.size());
+    (void)erased;
+}
+
+// 是否已达连接数上限。加锁读取, 与 add_connection/remove_connection 保持一致。
+bool Server::at_connection_limit() {
+    std::lock_guard<std::mutex> lock(connections_mutex_);
+    return connections_.size() >= max_connections_;
+}
+
+// ============================================================================
+// sweeper_loop() - 空闲连接回收线程
+// ============================================================================
+void Server::sweeper_loop() {
+    while (g_running.load(std::memory_order_acquire)) {
+        cyrus_sleep_ms(250);
+        if (!g_running.load(std::memory_order_acquire)) break;
+        sweep_idle_connections();
+    }
+}
+
+// ============================================================================
+// sweep_idle_connections() - 回收空闲超时的 keep-alive 连接
+// ============================================================================
+// 在锁内挑出候选 (只读), 在锁外关闭 —— 避免在持锁期间调用 close()。
+// 正在被 SSE 中继持有的连接跳过: 长流可能长时间没有数据, 但它并不是空闲。
+void Server::sweep_idle_connections() {
+    std::vector<Connection*> expired;
+    {
+        std::lock_guard<std::mutex> lock(connections_mutex_);
+        for (auto& [fd, conn] : connections_) {
+            if (conn->is_closed() || conn->is_streaming()) continue;
+            if (conn->idle_ms() > keepalive_timeout_ms_) {
+                expired.push_back(conn.get());
+            }
+        }
+    }
+
+    for (Connection* conn : expired) {
+        socket_t fd = conn->fd();
+        LOG_DEBUG("Keep-alive timeout: fd={}, idle={}ms",
+                  static_cast<int>(fd), conn->idle_ms());
+        // 只关闭, 不在此处销毁: 该连接可能仍有挂起的 recv,
+        // 销毁由处理那个完成事件的 worker 线程完成 (它会看到 is_closed())。
+        conn->on_timeout();
+    }
 }
 
 } // namespace gateway

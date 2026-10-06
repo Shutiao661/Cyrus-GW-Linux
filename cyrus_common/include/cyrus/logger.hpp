@@ -79,6 +79,13 @@ public:
         // 线程安全输出
         std::lock_guard<std::mutex> lock(mutex_);
         fwrite(line.data(), 1, line.size(), stdout);
+
+        // WARN 及以上立即落盘: stdout 被重定向到文件/管道时 stdio 是全缓冲,
+        // 运行中 tail 不到任何内容, 进程被强杀还会整体丢失。
+        // 错误日志稀少, 这点开销可忽略; INFO/DEBUG 保持缓冲以维持吞吐。
+        if (level >= LogLevel::WARN) {
+            fflush(stdout);
+        }
     }
 
 private:

@@ -17,14 +17,17 @@ namespace gateway {
 // ============================================================================
 Connection::Connection(socket_t fd, IOEngine* engine, BufferPool* pool,
                        Router* router, RateLimiter* rate_limiter,
-                       std::string client_ip)
+                       std::string client_ip,
+                       size_t max_keepalive_requests, size_t max_header_size)
     : fd_(fd)
     , engine_(engine)
     , pool_(pool)
     , router_(router)
     , rate_limiter_(rate_limiter)
     , client_ip_(std::move(client_ip))
+    , max_keepalive_requests_(max_keepalive_requests)
 {
+    parser_.set_max_header_size(max_header_size);
     LOG_DEBUG("Connection created: fd={}", static_cast<int>(fd));
     last_activity_ = std::chrono::steady_clock::now();
 }
@@ -210,12 +213,12 @@ void Connection::on_send_complete(IOContext* ctx) {
     // 释放发送缓冲区 (RAII 归还给池)
     send_buffer_ = BufferHandle();
 
-    if (keep_alive_ && request_count_ < MAX_KEEPALIVE_REQUESTS) {
+    if (keep_alive_ && request_count_ < max_keepalive_requests_) {
         // --- keep-alive: 等待下一个请求 ---
         transition_to_idle();
     } else {
         // --- 关闭连接 ---
-        if (request_count_ >= MAX_KEEPALIVE_REQUESTS) {
+        if (request_count_ >= max_keepalive_requests_) {
             LOG_DEBUG("Max keep-alive requests reached for fd {}", static_cast<int>(fd_));
         }
         close();
@@ -485,13 +488,26 @@ void Connection::close() {
 
     // 关闭 socket
     if (fd_ != INVALID_SOCKET_VAL) {
-        // 优雅关闭: shutdown → 让对端知道我们将要断开
-        shutdown(fd_, SHUT_WR);  // 半关闭 (发送方向)
+        // 必须是 SHUT_RDWR (而非仅 SHUT_WR):
+        // POSIX fallback 下 worker 线程同步阻塞在 ::recv 上, 而 shutdown(SHUT_WR)
+        // 只影响写方向, 唤不醒阻塞的 ::recv; 从别的线程 close(fd) 同样唤不醒
+        // (内核里已阻塞的系统调用仍持有该文件引用)。结果是 Server::stop()
+        // 关闭连接后 join(worker) 会永久挂起。
+        // SHUT_RDWR 会让阻塞中的 ::recv 立即返回, worker 得以退出。
+        shutdown(fd_, SHUT_RDWR);
         cyrus_close_socket(fd_);
         fd_ = INVALID_SOCKET_VAL;
     }
 
     state_ = ConnectionState::CLOSED;
+}
+
+// ============================================================================
+// idle_ms() - 空闲时长 (毫秒)
+// ============================================================================
+int64_t Connection::idle_ms() const {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - last_activity_).count();
 }
 
 } // namespace gateway

@@ -51,11 +51,13 @@ public:
         std::vector<std::string> tokens = generate_mock_tokens(prompt);
 
         std::vector<std::string> chunks;
-        chunks.reserve(tokens.size() + 1);
+        chunks.reserve(tokens.size());
         for (const auto& token : tokens) {
             chunks.push_back(SSEFormatter::completion_chunk(build_chunk_json(token)));
         }
-        chunks.push_back(SSEFormatter::stream_done());
+        // 不在此处发 [DONE]: 流的结束由协议层 MSG_RESPONSE_END 表达,
+        // Gateway 的中继器会在流结束时统一补一个 [DONE]
+        // (两边都发会让客户端收到两次 [DONE])。
         return chunks;
     }
 

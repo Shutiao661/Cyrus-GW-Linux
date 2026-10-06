@@ -82,12 +82,13 @@ public:
         ev.data.fd = listen_fd_;
         epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, listen_fd_, &ev);
 
+        running_.store(true);
         thread_ = std::thread(&EpollEchoServer::run, this);
         return true;
     }
 
     void stop() {
-        g_running.store(false);
+        running_.store(false);
         if (thread_.joinable()) thread_.join();
         if (listen_fd_ >= 0) close(listen_fd_);
         if (epoll_fd_ >= 0) close(epoll_fd_);
@@ -98,7 +99,7 @@ private:
         constexpr int MAX_EVENTS = 256;
         epoll_event events[MAX_EVENTS];
 
-        while (g_running.load()) {
+        while (running_.load()) {
             int n = epoll_wait(epoll_fd_, events, MAX_EVENTS, 1000);
             for (int i = 0; i < n; ++i) {
                 int fd = events[i].data.fd;
@@ -150,6 +151,7 @@ private:
 
     int listen_fd_ = -1;
     int epoll_fd_ = -1;
+    std::atomic<bool> running_{false};  // 服务器自身生命周期 (与客户端的 g_running 区分)
     std::thread thread_;
 };
 

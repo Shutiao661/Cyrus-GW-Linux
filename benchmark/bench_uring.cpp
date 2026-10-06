@@ -85,12 +85,13 @@ public:
 
         engine_.register_socket(listen_fd_, nullptr);
 
+        running_.store(true);
         thread_ = std::thread(&UringEchoServer::run, this);
         return true;
     }
 
     void stop() {
-        g_running.store(false);
+        running_.store(false);
         engine_.post_wakeup();
         if (thread_.joinable()) thread_.join();
         engine_.shutdown();
@@ -106,7 +107,7 @@ private:
         constexpr int MAX_EVENTS = 256;
         IOContext* completions[MAX_EVENTS];
 
-        while (g_running.load()) {
+        while (running_.load()) {
             int n = engine_.wait_completions(completions, MAX_EVENTS, 1000);
             for (int i = 0; i < n; ++i) {
                 IOContext* ctx = completions[i];
@@ -159,6 +160,7 @@ private:
 
     IOEngineUring engine_;
     int listen_fd_ = -1;
+    std::atomic<bool> running_{false};  // 服务器自身生命周期 (与客户端的 g_running 区分)
     std::thread thread_;
 };
 

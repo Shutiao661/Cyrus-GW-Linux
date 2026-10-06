@@ -21,6 +21,7 @@ Router::Router(const Config& config) : config_(config) {
     agent_host_      = config_.get("agent", "host", "127.0.0.1");
     agent_port_      = config_.get_int("agent", "port", 9999);
     agent_pool_size_ = config_.get_int("agent", "pool_size", 4);
+    agent_connect_timeout_ms_ = config_.get_int("agent", "connect_timeout_ms", 5000);
 }
 
 Router::~Router() {
@@ -49,7 +50,7 @@ bool Router::init() {
     agent_pool_.reserve(agent_pool_size_);
     for (int i = 0; i < agent_pool_size_; ++i) {
         auto client = std::make_unique<AgentClient>();
-        if (client->connect(agent_host_, agent_port_)) {
+        if (connect_agent(client.get())) {
             LOG_DEBUG("Agent client #{} connected", i);
             agent_pool_.push_back(std::move(client));
         } else {
@@ -85,6 +86,12 @@ bool Router::route(Connection* conn, const ParsedRequest& request) {
 // ============================================================================
 // Agent 连接池管理
 // ============================================================================
+
+// 用配置的连接超时连接 Agent (避免对端不可达时阻塞 worker/中继线程)
+bool Router::connect_agent(AgentClient* client) {
+    return client->connect(agent_host_, agent_port_, agent_connect_timeout_ms_);
+}
+
 AgentClient* Router::acquire_agent_client() {
     std::lock_guard<std::mutex> lock(pool_mutex_);
 
@@ -105,7 +112,10 @@ AgentClient* Router::acquire_agent_client() {
             continue;
         }
 
-        if (client->is_connected()) {
+        // fd 有效 且 对端未关闭 → 可复用。
+        // 必须探活: Agent 处理完一个请求就关闭连接, 而 TCP 半关闭在本地
+        // 看不出来, 只看 is_connected() 会一直派发死连接。
+        if (client->is_connected() && !client->peer_closed()) {
             // 原子抢占使用权; 失败说明发生并发竞争, 尝试下一个
             if (client->try_acquire()) {
                 return client.get();
@@ -116,7 +126,7 @@ AgentClient* Router::acquire_agent_client() {
         // 连接已断开, 尝试重连
         LOG_WARN("Agent client #{} disconnected, attempting reconnect to {}:{}",
                  index, agent_host_, agent_port_);
-        if (client->connect(agent_host_, agent_port_)) {
+        if (connect_agent(client.get())) {
             LOG_INFO("Agent client #{} reconnected successfully", index);
             if (client->try_acquire()) {
                 return client.get();
@@ -160,12 +170,12 @@ void Router::health_check() {
             continue;
         }
 
-        if (client->is_connected()) {
+        if (client->is_connected() && !client->peer_closed()) {
             healthy++;
         } else {
             unhealthy++;
             // 尝试后台重连
-            if (client->connect(agent_host_, agent_port_)) {
+            if (connect_agent(client.get())) {
                 healthy++;
                 unhealthy--;
                 LOG_INFO("Agent client #{} reconnected during health check", i);
@@ -319,13 +329,26 @@ void Router::dispatch_relay(AgentClient* agent, Connection* conn,
 
         active_relays_.fetch_add(1, std::memory_order_acq_rel);
 
+        // 在 spawn 之前打上中继标记: dispatch_relay 返回后 worker 线程会检查
+        // 这条连接能否销毁, 标记必须先于中继线程存在。
+        const socket_t conn_fd = conn->fd();
+        conn->mark_streaming();
+
         try {
-            relay_threads_.emplace_back([this, agent, conn, sse_timeout] {
+            relay_threads_.emplace_back([this, agent, conn, conn_fd, sse_timeout] {
                 relay_stream(agent, conn, sse_timeout);
+
+                // 中继结束: 清除标记后本线程即为该连接的最后使用者,
+                // 可安全摘除 (reap 之后不得再访问 conn)。
+                conn->unmark_streaming();
+                if (reap_connection_) {
+                    reap_connection_(conn_fd);
+                }
                 active_relays_.fetch_sub(1, std::memory_order_acq_rel);
                 relay_cv_.notify_all();
             });
         } catch (const std::system_error& e) {
+            conn->unmark_streaming();
             active_relays_.fetch_sub(1, std::memory_order_acq_rel);
             LOG_ERROR("Failed to spawn relay thread: {}", e.what());
             release_agent_client(agent);
@@ -344,6 +367,10 @@ void Router::relay_stream(AgentClient* agent, Connection* conn,
                           SSERelayTimeout sse_timeout) {
     // --- 初始化 SSE 中继器 ---
     SSERelayHandler relay(sse_timeout);
+    LOG_DEBUG("SSE relay timeouts: first_byte={}ms total={}ms idle={}ms",
+              sse_timeout.first_byte_timeout_ms,
+              sse_timeout.total_timeout_ms,
+              sse_timeout.idle_timeout_ms);
 
     // --- 立即发送 SSE HTTP header → 客户端可以开始接收数据 ---
     std::string sse_header = relay.build_sse_header();

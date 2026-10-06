@@ -413,9 +413,12 @@ void AgentServer::process_request_on_connection(
 
         // 发送结束帧
         auto end_frame = ProtocolCodec::encode_response_end(header.request_id);
-        send(client_fd,
-             reinterpret_cast<const char*>(end_frame.data()),
-             static_cast<int>(end_frame.size()), 0);
+        if (send(client_fd,
+                 reinterpret_cast<const char*>(end_frame.data()),
+                 static_cast<int>(end_frame.size()), 0) == SOCKET_ERROR_VAL) {
+            LOG_WARN("AgentServer: failed to send response end to fd={}", static_cast<int>(client_fd));
+            goto cleanup_client;
+        }
     } else {
         // 单帧响应
         auto headers_frame = ProtocolCodec::encode_response_headers(
@@ -435,23 +438,34 @@ void AgentServer::process_request_on_connection(
                 header.request_id,
                 resp.body,
                 true);  // is_last = true
-            send(client_fd,
-                 reinterpret_cast<const char*>(data_frame.data()),
-                 static_cast<int>(data_frame.size()), 0);
+            if (send(client_fd,
+                     reinterpret_cast<const char*>(data_frame.data()),
+                     static_cast<int>(data_frame.size()), 0) == SOCKET_ERROR_VAL) {
+                LOG_WARN("AgentServer: failed to send response body to fd={}", static_cast<int>(client_fd));
+                goto cleanup_client;
+            }
         }
 
         auto end_frame = ProtocolCodec::encode_response_end(header.request_id);
-        send(client_fd,
-             reinterpret_cast<const char*>(end_frame.data()),
-             static_cast<int>(end_frame.size()), 0);
+        if (send(client_fd,
+                 reinterpret_cast<const char*>(end_frame.data()),
+                 static_cast<int>(end_frame.size()), 0) == SOCKET_ERROR_VAL) {
+            LOG_WARN("AgentServer: failed to send response end to fd={}", static_cast<int>(client_fd));
+            goto cleanup_client;
+        }
     }
 
-    // 修复: 等待所有数据帧和 MSG_RESPONSE_END 发送完成后再关闭连接
-    // (之前版本的过早关闭会导致 Gateway 端接收不完整)
-    LOG_DEBUG("AgentServer: response sent to fd={}, closing connection",
+    // 响应发送完成 → 保持连接开放, 等待下一个请求帧。
+    // 与 Gateway 的 AgentClient 连接池配套: 连接池按"长连接复用"设计,
+    // 若这里每个请求都关闭连接, 池子会把已关闭的连接反复派发出去
+    // (TCP 半关闭在本地 fd 上看不出来), 导致请求间歇失败。
+    // 每连接的 ProtocolDecoder 会持续累积, 可连续解出多个请求帧。
+    LOG_DEBUG("AgentServer: response sent to fd={}, keeping connection alive",
               static_cast<int>(client_fd));
+    return;
 
 cleanup_client:
+    // 发送失败/协议错误: 连接已不可用, 关闭并回收连接状态
     {
         std::lock_guard<std::mutex> lock(clients_mutex_);
         clients_.erase(client_fd);

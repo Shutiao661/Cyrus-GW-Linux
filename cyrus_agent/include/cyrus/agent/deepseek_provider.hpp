@@ -84,7 +84,6 @@ private:
             LOG_ERROR("DeepSeek: popen failed: {}", strerror(errno));
             chunks.push_back(SSEFormatter::completion_chunk(
                 R"({"choices":[{"delta":{"content":"[Error: API unreachable]"},"index":0}],"error":"popen failed"})"));
-            chunks.push_back(SSEFormatter::stream_done());
             return chunks;
         }
 
@@ -139,7 +138,7 @@ private:
             }
         }
 
-        chunks.push_back(SSEFormatter::stream_done());
+        // 结束标记由 Gateway 的中继器在 MSG_RESPONSE_END 时统一补发 (见 chat_handler)
         return chunks;
     }
 

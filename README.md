@@ -8,7 +8,9 @@
 **Cyrus-GW** 是一个用 C++20 编写的高性能异步 HTTP 网关，专为 LLM 流式场景设计。
 通过 **Gateway / Agent 双服务架构**，将接入层 I/O 与业务逻辑隔离；内置 **DeepSeek API** 集成，开箱即用。
 
-> 仅支持 **Linux**。I/O 引擎在 `liburing` 可用时走完整 io_uring 实现，否则自动降级为 POSIX fallback（阻塞式 socket + 工作线程），对外行为一致。
+> 仅支持 **Linux**。I/O 引擎在 `liburing` 可用时走完整 io_uring 实现，否则自动降级为 POSIX fallback（阻塞式 socket + 工作线程）。
+>
+> ⚠️ 两者的**功能**一致（接口、超时、协议处理相同），但**并发能力不同**：POSIX fallback 下 recv/send 在工作线程中同步阻塞，一条连接在收到数据前会占住一个 worker，因此并发上限约等于 `worker_threads`。它只用于无 liburing 时的功能验证；压测与生产请装 `liburing`（`apt install liburing-dev`）走 io_uring 路径。
 
 ---
 
@@ -239,24 +241,24 @@ worker_threads = 0                # 工作线程数，0 = 自动（CPU 核心数
 [agent]
 host = 127.0.0.1                  # Agent 后端地址
 port = 9999                       # Agent 后端端口
-pool_size = 4                     # Agent 连接池大小
-connect_timeout_ms = 5000         # 连接超时
-request_timeout_ms = 30000        # 请求超时
+pool_size = 4                     # Agent 连接池大小（同时限制并发流数）
+connect_timeout_ms = 5000         # 连接超时（非阻塞 connect + poll）
+request_timeout_ms = 30000        # 一次 Agent 请求的总预算，[sse] total_timeout_ms 优先
 
 [connection]
-max_connections = 10000           # 最大并发连接数
-keepalive_timeout_s = 5           # Keep-alive 空闲超时（秒）
+max_connections = 10000           # 最大并发连接数（超限直接拒绝）
+keepalive_timeout_s = 5           # Keep-alive 空闲超时（秒），由扫描线程回收
 max_keepalive_requests = 1000     # 单连接最大 keep-alive 请求数
-max_header_size = 8192            # 最大请求头大小（字节）
+max_header_size = 8192            # 最大请求头大小（字节），超限返回 400
 
 [logging]
 level = INFO                      # DEBUG | INFO | WARN | ERROR
-# file = logs/gateway.log          # 为空则输出到 stdout
+# 输出到 stdout；WARN 及以上立即刷盘，INFO/DEBUG 保持缓冲
 
 [rate_limit]
 global_rate = 1000                # 全局限流 tokens/秒
 global_capacity = 2000            # 全局突发容量
-per_ip_rate = 50                  # 每 IP 限流 tokens/秒
+per_ip_rate = 50                  # 每 IP 限流 tokens/秒（按 accept 时提取的客户端 IP）
 per_ip_capacity = 100             # 每 IP 突发容量
 
 [sse]
@@ -265,6 +267,7 @@ total_timeout_ms = 120000         # 总超时
 idle_timeout_ms = 30000           # 帧间空闲超时
 ```
 
+> 上表所有配置项均已接线生效。
 ---
 
 ## 项目结构
