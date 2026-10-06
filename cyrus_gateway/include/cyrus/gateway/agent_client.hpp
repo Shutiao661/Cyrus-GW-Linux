@@ -7,7 +7,7 @@
 // 工作流程:
 //   1. 连接到 Agent (TCP, 127.0.0.1:9999)
 //   2. 发送编码的请求帧
-//   3. 接收响应帧 (通过回调通知路由器)
+//   3. 由 Router 的中继线程同步 recv_packet() 收取响应帧
 //
 // 连接复用: 一个 AgentClient 可以被多个请求复用 (串行)
 // 连接池: Router 维护多个 AgentClient 实例 (round-robin 负载均衡)
@@ -19,15 +19,13 @@
 #include "cyrus/protocol.hpp"
 
 #include <string>
-#include <functional>
+#include <atomic>
 
 namespace cyrus {
 namespace gateway {
 
-class Router;  // 前向声明
-
 class AgentClient {
-public:
+public: 
     AgentClient() = default;
     ~AgentClient();
 
@@ -49,6 +47,22 @@ public:
     // 是否已连接
     bool is_connected() const noexcept { return fd_ != INVALID_SOCKET_VAL; }
 
+    // --- 忙标记 (并发独占) ---
+    // 一个 AgentClient 的底层 socket 是串行协议, 同一时刻只能服务一个流式请求。
+    // try_acquire() 用 CAS 原子地抢占使用权; 失败表示正被其他请求占用。
+    bool try_acquire() noexcept {
+        bool expected = false;
+        return in_use_.compare_exchange_strong(expected, true,
+                                               std::memory_order_acq_rel,
+                                               std::memory_order_acquire);
+    }
+
+    // 归还使用权 (供下一个请求复用)
+    void mark_idle() noexcept { in_use_.store(false, std::memory_order_release); }
+
+    // 是否正被占用
+    bool is_in_use() const noexcept { return in_use_.load(std::memory_order_acquire); }
+
     // --- 数据收发 ---
 
     // 发送二进制协议帧 (阻塞发送)
@@ -62,19 +76,11 @@ public:
     // 返回 true 表示接收成功
     bool recv_packet(std::vector<uint8_t>& out_frame, int timeout_ms = 5000);
 
-    // --- 回调设置 ---
-
-    // 设置路由器引用 (用于接收 Agent 响应后回调)
-    void set_router(Router* router) { router_ = router; }
-
-    // 获取 socket fd
-    socket_t fd() const noexcept { return fd_; }
-
 private:
     socket_t fd_ = INVALID_SOCKET_VAL;
-    Router* router_ = nullptr;
     std::string host_;
     int port_ = 0;
+    std::atomic<bool> in_use_{false};  // 并发独占标记 (串行协议复用保护)
 };
 
 } // namespace gateway

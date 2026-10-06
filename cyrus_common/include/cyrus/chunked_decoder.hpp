@@ -79,9 +79,6 @@ public:
         error_msg_ = nullptr;
     }
 
-    // 缓冲区中未处理的字节数
-    size_t buffered_bytes() const noexcept { return buffer_.size(); }
-
 private:
     void process_buffer() {
         bool progress = true;

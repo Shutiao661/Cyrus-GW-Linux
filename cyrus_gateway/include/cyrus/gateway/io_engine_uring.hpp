@@ -1,23 +1,13 @@
 // ============================================================================
 // io_engine_uring.hpp - Linux io_uring I/O 引擎
 // ============================================================================
-// 在 Linux 上提供基于 io_uring 的高性能异步 I/O。
-// 在非 Linux 平台 (Windows/macOS) 上编译为存根 (返回错误)。
+// 基于 io_uring 的高性能异步 I/O。liburing 不可用时回退 POSIX (同步 I/O)。
 //
 // io_uring 核心原理:
 //   - SQ (Submission Queue): 用户态→内核态, 环形缓冲区, 提交 I/O 请求
 //   - CQ (Completion Queue): 内核态→用户态, 环形缓冲区, 返回 I/O 结果
 //   - 两个队列通过共享内存映射, 避免系统调用
 //   - 支持批量提交 (多个 SQE 一次 enter) 和批量收割 (多个 CQE 一次 peek)
-//
-// 与 IOCP 的对应关系:
-//   io_uring                        IOCP
-//   ─────────                       ────
-//   io_uring_queue_init          →  CreateIoCompletionPort
-//   io_uring_prep_accept + submit →  AcceptEx
-//   io_uring_prep_recv  + submit →  WSARecv
-//   io_uring_prep_send  + submit →  WSASend
-//   io_uring_peek_batch_cqe      →  GetQueuedCompletionStatusEx
 // ============================================================================
 
 #pragma once

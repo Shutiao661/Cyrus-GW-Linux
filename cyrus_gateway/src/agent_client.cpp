@@ -69,19 +69,27 @@ bool AgentClient::send_packet(const std::vector<uint8_t>& data) {
         return false;
     }
 
-    int result = ::send(fd_,
-                        reinterpret_cast<const char*>(data.data()),
-                        static_cast<int>(data.size()),
-                        0);  // 无特殊标志
+    // 循环发送直到全部写入 (处理部分发送; agent socket 为阻塞模式)
+    size_t sent_total = 0;
+    while (sent_total < data.size()) {
+        int n = ::send(fd_,
+                       reinterpret_cast<const char*>(data.data() + sent_total),
+                       static_cast<int>(data.size() - sent_total),
+                       0);  // 无特殊标志
 
-    if (result == SOCKET_ERROR_VAL) {
-        LOG_ERROR("AgentClient: send failed: {}", cyrus_socket_error());
-        return false;
-    }
-
-    if (static_cast<size_t>(result) != data.size()) {
-        LOG_WARN("AgentClient: partial send: {}/{} bytes", result, data.size());
-        // 简化: 不处理部分发送 (帧通常 < 4KB)
+        if (n == SOCKET_ERROR_VAL) {
+            int err = cyrus_socket_error();
+            if (err == CYRUS_EINTR) {
+                continue;  // 被信号中断, 重试
+            }
+            LOG_ERROR("AgentClient: send failed: {}", err);
+            return false;
+        }
+        if (n == 0) {
+            LOG_ERROR("AgentClient: send returned 0 (connection closed)");
+            return false;
+        }
+        sent_total += static_cast<size_t>(n);
     }
 
     return true;
@@ -98,16 +106,10 @@ bool AgentClient::recv_packet(std::vector<uint8_t>& out_frame, int timeout_ms) {
     }
 
     // --- 设置接收超时 ---
-#ifdef _WIN32
-    DWORD timeout = static_cast<DWORD>(timeout_ms);
-    setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO,
-               reinterpret_cast<const char*>(&timeout), sizeof(timeout));
-#else
     struct timeval tv;
     tv.tv_sec = timeout_ms / 1000;
     tv.tv_usec = (timeout_ms % 1000) * 1000;
     setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-#endif
 
     // --- 第 1 步: 读取 4 字节长度前缀 ---
     uint32_t payload_len_net = 0;

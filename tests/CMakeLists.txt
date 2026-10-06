@@ -54,3 +54,17 @@ target_include_directories(test_body_parser PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../cyrus_gateway/include)
 set_compiler_warnings(test_body_parser)
 add_test(NAME test_body_parser COMMAND test_body_parser)
+
+# --- 端到端集成测试 ---
+# 启动 Agent(Mock) + Gateway 两个可执行文件, 用 curl 验证 /health 与 SSE 流。
+# 依赖 bash + curl; 端口默认 19999/18080, 可用环境变量覆盖。
+if(TARGET cyrus_gateway AND TARGET cyrus_agent)
+    add_test(NAME integration_test
+        COMMAND bash
+            ${CMAKE_CURRENT_SOURCE_DIR}/integration_test.sh
+            $<TARGET_FILE:cyrus_agent>
+            $<TARGET_FILE:cyrus_gateway>)
+    set_tests_properties(integration_test PROPERTIES
+        TIMEOUT 90
+        LABELS "integration")
+endif()

@@ -13,8 +13,6 @@
 // 用法: ./bench_uring --clients=500 --path=full_chain --duration=30
 // ============================================================================
 
-#ifdef __linux__
-
 #include "../cyrus_gateway/include/cyrus/gateway/io_engine_uring.hpp"
 #include "../cyrus_gateway/include/cyrus/gateway/coro_engine.hpp"
 
@@ -291,11 +289,3 @@ int main(int argc, char* argv[]) {
     print_stats(elapsed, "io_uring Coroutine Server");
     return 0;
 }
-
-#else
-#include <cstdio>
-int main() {
-    printf("bench_uring is Linux-only.\n");
-    return 1;
-}
-#endif

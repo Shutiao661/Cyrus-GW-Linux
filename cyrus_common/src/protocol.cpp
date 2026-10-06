@@ -32,27 +32,11 @@ void write_u32(std::vector<uint8_t>& buf, uint32_t val) {
     buf.insert(buf.end(), bytes, bytes + sizeof(uint32_t));
 }
 
-// 写入 uint64_t (大端)
-void write_u64(std::vector<uint8_t>& buf, uint64_t val) {
-    // 手动转大端: Windows 上没有 htonll, 所以手动实现
-    uint32_t high = htonl(static_cast<uint32_t>(val >> 32));
-    uint32_t low  = htonl(static_cast<uint32_t>(val & 0xFFFFFFFFULL));
-    const auto* hbytes = reinterpret_cast<const uint8_t*>(&high);
-    const auto* lbytes = reinterpret_cast<const uint8_t*>(&low);
-    buf.insert(buf.end(), hbytes, hbytes + sizeof(uint32_t));
-    buf.insert(buf.end(), lbytes, lbytes + sizeof(uint32_t));
-}
-
 // 写入 uint16_t (大端)
 void write_u16(std::vector<uint8_t>& buf, uint16_t val) {
     uint16_t net_val = htons(val);
     const auto* bytes = reinterpret_cast<const uint8_t*>(&net_val);
     buf.insert(buf.end(), bytes, bytes + sizeof(uint16_t));
-}
-
-// 写入 uint8_t
-void write_u8(std::vector<uint8_t>& buf, uint8_t val) {
-    buf.push_back(val);
 }
 
 // 写入字符串 (长度前缀格式: u16 length + data)

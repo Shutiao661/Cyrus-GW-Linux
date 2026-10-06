@@ -28,8 +28,6 @@ public:
         , model_(std::move(model))
     {}
 
-    const char* name() const override { return "deepseek"; }
-
     std::vector<std::string> generate(const std::string& prompt) override {
         return call_deepseek_api(prompt);
     }

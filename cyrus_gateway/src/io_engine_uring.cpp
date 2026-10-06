@@ -61,12 +61,21 @@ void IOEngineUring::shutdown() {
         if (sqe) { io_uring_prep_nop(sqe); sqe->user_data = 0; io_uring_submit(&ring_); }
     }
     io_uring_queue_exit(&ring_);
+    if (listen_fd_ != INVALID_SOCKET_VAL) {
+        ::close(listen_fd_);
+        listen_fd_ = INVALID_SOCKET_VAL;
+    }
 #else
     // 唤醒 accept 线程和 worker 线程
     post_wakeup();
     if (accept_thread_.joinable()) {
-        // 关闭监听 socket 使 accept() 返回
-        if (listen_fd_ != INVALID_SOCKET_VAL) ::close(listen_fd_);
+        // 关键: 用 shutdown(SHUT_RDWR) 解除阻塞在 accept() 上的线程。
+        // close(fd) 无法解除另一个线程的 accept() 阻塞 (会永久挂起)。
+        if (listen_fd_ != INVALID_SOCKET_VAL) {
+            ::shutdown(listen_fd_, SHUT_RDWR);
+            ::close(listen_fd_);
+            listen_fd_ = INVALID_SOCKET_VAL;
+        }
         accept_thread_.join();
     }
 #endif
@@ -83,7 +92,13 @@ bool IOEngineUring::register_socket(socket_t fd, void* user_data) {
 #if CYRUS_HAS_LIBURING
     return true;
 #else
-    // POSIX fallback: 记住监听 fd 用于 accept 线程
+    // POSIX fallback: 使用阻塞式 socket (recv/send 在 worker 线程中同步执行),
+    // 清除非阻塞标志避免 EAGAIN 被误判为 0 字节导致连接被立即关闭
+    int flags = ::fcntl(static_cast<int>(fd), F_GETFL, 0);
+    if (flags != -1) {
+        ::fcntl(static_cast<int>(fd), F_SETFL, flags & ~O_NONBLOCK);
+    }
+    // 记住监听 fd 用于 accept 线程
     if (listen_fd_ == INVALID_SOCKET_VAL) listen_fd_ = fd;
     return true;
 #endif
@@ -93,14 +108,18 @@ bool IOEngineUring::register_socket(socket_t fd, void* user_data) {
 // post_accept() - 投递 Accept
 // ============================================================================
 int IOEngineUring::post_accept(socket_t listen_fd, IOContext* base_ctx) {
+    // 记录监听 socket (shutdown 时由引擎统一关闭, io_uring/POSIX 两种模式都需)
+    listen_fd_ = listen_fd;
+
 #if CYRUS_HAS_LIBURING
     UringContext* ctx = static_cast<UringContext*>(base_ctx);
     struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
     if (!sqe) { LOG_ERROR("SQ full"); return -1; }
-    sockaddr_in client_addr{};
-    socklen_t addr_len = sizeof(client_addr);
+    // 使用 ctx 内部的地址缓冲 (异步完成前必须保持有效)
+    ctx->accept_addr_len = sizeof(ctx->accept_addr);
     io_uring_prep_accept(sqe, static_cast<int>(listen_fd),
-                         reinterpret_cast<sockaddr*>(&client_addr), &addr_len, 0);
+                         reinterpret_cast<sockaddr*>(&ctx->accept_addr),
+                         &ctx->accept_addr_len, 0);
     ctx->op = IOOperation::ACCEPT;
     ctx->fd = listen_fd;
     sqe->user_data = UringContext::encode(IOOperation::ACCEPT, ctx);
@@ -108,7 +127,6 @@ int IOEngineUring::post_accept(socket_t listen_fd, IOContext* base_ctx) {
     return 0;
 #else
     // POSIX fallback: 启动 accept 线程 (首次调用时)
-    listen_fd_ = listen_fd;
     base_ctx->op = IOOperation::ACCEPT;
     base_ctx->fd = listen_fd;
 
@@ -129,6 +147,8 @@ int IOEngineUring::post_accept(socket_t listen_fd, IOContext* base_ctx) {
                 ctx->op = IOOperation::ACCEPT;
                 ctx->fd = listen_fd_;
                 ctx->accept_fd = client_fd;
+                ctx->accept_addr = client_addr;
+                ctx->accept_addr_len = addr_len;
                 ctx->error = 0;
 
                 // 推入完成队列
@@ -262,6 +282,10 @@ int IOEngineUring::wait_completions(IOContext** contexts, int max_events,
         UringContext* ctx = UringContext::decode_ctx(cqe->user_data);
         if (cqe->res >= 0) { ctx->bytes_transferred = static_cast<size_t>(cqe->res); ctx->error = 0; }
         else { ctx->bytes_transferred = 0; ctx->error = -cqe->res; }
+        // ACCEPT 操作的结果是新的连接 fd (而非字节数)
+        if (UringContext::decode_op(cqe->user_data) == IOOperation::ACCEPT && cqe->res >= 0) {
+            ctx->accept_fd = static_cast<socket_t>(cqe->res);
+        }
         contexts[count++] = ctx;
         io_uring_cqe_seen(&ring_, cqe);
     }
@@ -330,6 +354,18 @@ void IOEngineUring::release_context(IOContext* ctx) {
     ctx->buffer_len = 0;
     ctx->bytes_transferred = 0;
     free_contexts_.push_back(static_cast<UringContext*>(ctx));
+}
+
+// ============================================================================
+// create_io_engine() - 引擎工厂
+// ============================================================================
+std::unique_ptr<IOEngine> create_io_engine() {
+#if CYRUS_HAS_LIBURING
+    LOG_INFO("Creating IOEngine: io_uring (liburing)");
+#else
+    LOG_INFO("Creating IOEngine: io_uring (POSIX fallback)");
+#endif
+    return std::make_unique<IOEngineUring>();
 }
 
 } // namespace gateway

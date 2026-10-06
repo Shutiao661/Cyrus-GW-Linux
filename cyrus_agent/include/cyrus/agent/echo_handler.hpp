@@ -31,8 +31,6 @@ public:
         return AgentResponse::json(200, json);
     }
 
-    const char* name() const override { return "EchoHandler"; }
-
 private:
     // 转义 JSON 字符串中的特殊字符
     static std::string escape_json(const std::string& s) {

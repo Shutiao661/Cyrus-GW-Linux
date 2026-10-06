@@ -25,12 +25,16 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <atomic>
+#include <condition_variable>
+#include <thread>
 
 namespace cyrus {
 namespace gateway {
 
 // 前向声明
 class Connection;
+struct SSERelayTimeout;  // 定义于 sse_handler.hpp
 
 // ============================================================================
 // RouteHandler - 路由处理函数类型
@@ -64,6 +68,10 @@ public:
     // 归还 Agent 客户端 (不关闭连接)
     void release_agent_client(AgentClient* client);
 
+    // 优雅排空所有 SSE 中继线程 (阻塞直到全部结束)
+    // 必须在 Server 关闭 Connection 对象之前调用, 避免 use-after-free
+    void drain_relays();
+
 private:
     // --- 路由表 ---
     struct Route {
@@ -86,6 +94,25 @@ private:
 
     // --- 连接池管理 ---
     void health_check();  // 后台健康检查 + 自动重连
+    std::atomic<int> release_counter_{0};  // 归还计数 (周期性触发健康检查)
+    std::chrono::steady_clock::time_point start_time_{std::chrono::steady_clock::now()};  // 启动时刻 (健康检查 uptime)
+
+    // --- SSE 中继线程池 ---
+    // 聊天流式请求在独立线程中执行, 避免长连接独占 I/O worker 线程
+    std::atomic<int> active_relays_{0};          // 当前活跃的流式中继数
+    std::atomic<bool> relay_shutdown_{false};    // 关闭标志 (触发优雅排空)
+    std::mutex relay_mutex_;
+    std::condition_variable relay_cv_;
+    int max_concurrent_relays_ = 256;            // 最大并发流式连接数
+    std::vector<std::thread> relay_threads_;     // 可 join 的中继线程 (排空时 join)
+
+    // 将聊天请求分发到独立中继线程 (有界并发)
+    void dispatch_relay(AgentClient* agent, Connection* conn,
+                        SSERelayTimeout sse_timeout);
+
+    // 中继线程主体: 阻塞收取 Agent 帧并实时推送给客户端
+    void relay_stream(AgentClient* agent, Connection* conn,
+                      SSERelayTimeout sse_timeout);
 
     // --- 默认处理函数 ---
     void handle_404(Connection* conn, const ParsedRequest& request);

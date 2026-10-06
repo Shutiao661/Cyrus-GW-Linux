@@ -8,7 +8,7 @@
 //   - 高负载时池耗尽 → 返回 nullptr (不会阻塞)
 //
 // 为什么使用缓冲池?
-//   IOCP/io_uring 的异步 I/O 需要预分配缓冲区。
+//   io_uring 的异步 I/O 需要预分配缓冲区。
 //   每个 async recv 需要一个缓冲区保持有效直到完成事件到达。
 //   频繁 new/delete 会: (1) 内存碎片 (2) 系统调用开销 (3) 延迟不可预测
 //   缓冲池一次分配足够的内存, 之后都是 O(1) 的指针操作。
@@ -185,30 +185,11 @@ public:
         return BufferHandle(this, index, buf_ptr, buffer_size_);
     }
 
-    // --- 获取大小为 count 的 iovec 数组 (用于 io_uring register_buffers) ---
-    // 仅在 Linux 上使用, Windows 上保留接口
-    std::vector<std::pair<uint8_t*, size_t>> get_buffer_info() const {
-        std::vector<std::pair<uint8_t*, size_t>> result;
-        size_t count = memory_block_.size() / buffer_size_;
-        for (size_t i = 0; i < count; ++i) {
-            result.emplace_back(
-                const_cast<uint8_t*>(memory_block_.data() + i * buffer_size_),
-                buffer_size_);
-        }
-        return result;
-    }
-
     // --- 统计信息 ---
-    size_t total_count() const {
-        return memory_block_.size() / buffer_size_;
-    }
-
     size_t available_count() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return free_list_.size();
     }
-
-    size_t buffer_size() const noexcept { return buffer_size_; }
 
 private:
     friend class BufferHandle;

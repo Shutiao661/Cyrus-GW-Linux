@@ -1,23 +1,21 @@
 // ============================================================================
 // io_engine.hpp - 异步 I/O 引擎抽象接口
 // ============================================================================
-// 定义跨平台的异步 I/O 操作接口。
-// 设计哲学: io_uring (Linux) 和 IOCP (Windows) 都是 "投递操作 → 接收完成通知"
-// 的模型, 因此可以统一抽象为:
+// 定义异步 I/O 操作接口。io_uring 采用 "投递操作 → 接收完成通知" 模型,
+// 因此抽象为:
 //   1. post_xxx()  → 投递异步操作 (非阻塞, 立即返回)
 //   2. wait_completions() → 等待完成事件 (阻塞直到有事件到达)
 //   3. 完成回调 → 根据 IOContext 中的操作类型分发处理
 //
 // 具体实现:
-//   - IOEngineIocp  (Windows):  使用 IOCP (I/O Completion Port)
-//   - IOEngineUring (Linux):     使用 io_uring
-//   - IOEngineFake  (测试):      用于单元测试, 模拟 I/O 行为
+//   - IOEngineUring (Linux): 使用 io_uring (liburing 不可用时回退 POSIX)
 // ============================================================================
 
 #pragma once
 
 #include "cyrus/types.hpp"
 
+#include <netinet/in.h>  // sockaddr_in (Accept 完成时记录对端地址)
 #include <functional>
 #include <memory>
 
@@ -32,7 +30,6 @@ enum class IOOperation : uint8_t {
     ACCEPT = 1,    // 接受新连接 (仅监听 socket)
     RECV   = 2,    // 接收数据
     SEND   = 3,    // 发送数据
-    CLOSE  = 4,    // 关闭连接
 };
 
 // ============================================================================
@@ -53,6 +50,10 @@ struct IOContext {
     int          error = 0;               // 完成时: 0=成功, 非0=错误码
     void*        user_data = nullptr;      // 用户数据 (通常指向 Connection 对象)
 
+    // Accept 完成: 对端客户端地址 (用于 per-IP 限流等)
+    sockaddr_in  accept_addr{};
+    socklen_t    accept_addr_len = sizeof(sockaddr_in);
+
     // 重置上下文 (归还池前清空)
     void reset() {
         op = IOOperation::NONE;
@@ -63,6 +64,8 @@ struct IOContext {
         bytes_transferred = 0;
         error = 0;
         user_data = nullptr;
+        accept_addr = sockaddr_in{};
+        accept_addr_len = sizeof(sockaddr_in);
     }
 };
 
@@ -75,7 +78,7 @@ public:
 
     // --- 生命周期 ---
 
-    // 初始化引擎 (创建 IOCP 句柄 / io_uring 队列等)
+    // 初始化引擎 (创建 io_uring 队列等)
     // 返回 true 表示成功
     virtual bool init() = 0;
 
@@ -84,7 +87,7 @@ public:
 
     // --- Socket 注册 ---
 
-    // 将 socket 注册到引擎 (关联到 IOCP / 注册到 io_uring)
+    // 将 socket 注册到引擎
     // fd: 套接字
     // user_data: 与此 socket 关联的用户数据 (通常是 Connection*)
     virtual bool register_socket(socket_t fd, void* user_data) = 0;
@@ -125,9 +128,8 @@ public:
     // 用于在 shutdown 时唤醒阻塞在 wait_completions() 上的工作线程
     virtual void post_wakeup() = 0;
 
-    // --- Context Pool (跨平台) ---
+    // --- Context Pool ---
     // 从对象池获取/归还 IOContext。具体实现由子类提供:
-    //   IOEngineIocp → IOCPContext 池
     //   IOEngineUring → UringContext 池
     virtual IOContext* acquire_context() = 0;
     virtual void release_context(IOContext* ctx) = 0;
@@ -137,9 +139,7 @@ public:
 // 引擎工厂函数
 // ============================================================================
 
-// 根据当前平台创建最合适的 I/O 引擎
-// Windows → IOEngineIocp
-// Linux   → IOEngineUring (如果可用, 否则 fallback)
+// 创建 I/O 引擎 (io_uring, liburing 不可用时回退 POSIX)
 std::unique_ptr<IOEngine> create_io_engine();
 
 } // namespace gateway

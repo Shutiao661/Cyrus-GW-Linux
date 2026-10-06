@@ -2,10 +2,10 @@
 // connection.hpp - 每连接状态机
 // ============================================================================
 // 管理单个 TCP 连接的生命周期:
-//   ACCEPTED → READING_REQUEST → REQUEST_PARSED → SENDING_RESPONSE
-//                                                    ↓
-//                                   (keep-alive) → READING_REQUEST (循环)
-//                                   (close)      → CLOSING → CLOSED
+//   ACCEPTED → READING_REQUEST → SENDING_RESPONSE
+//                                     ↓
+//                    (keep-alive) → IDLE → READING_REQUEST (循环)
+//                    (close)      → CLOSING → CLOSED
 //
 // 连接对象负责:
 //   1. 接收数据 → 喂入 HTTP 解析器
@@ -24,7 +24,6 @@
 
 #include <memory>
 #include <chrono>
-#include <atomic>
 
 namespace cyrus {
 namespace gateway {
@@ -39,7 +38,6 @@ class Router;
 enum class ConnectionState : uint8_t {
     ACCEPTED,               // 初始: 连接已接受, 等待第一个 recv
     READING_REQUEST,        // 正在接收 HTTP 请求数据
-    REQUEST_PARSED,         // HTTP 请求解析完成, 待处理
     SENDING_RESPONSE,       // 正在发送 HTTP 响应
     IDLE,                   // 空闲 (keep-alive 模式, 等待下一个请求)
     CLOSING,                // 正在关闭
@@ -56,10 +54,10 @@ public:
     static constexpr int    KEEPALIVE_TIMEOUT_MS   = 5000;    // keep-alive 空闲超时 (5秒)
     static constexpr int    BODY_READ_TIMEOUT_MS   = 30000;   // 请求体读取超时 (30秒)
     static constexpr size_t MAX_KEEPALIVE_REQUESTS = 1000;    // keep-alive 最大请求数
-    static constexpr size_t RECV_BUFFER_SIZE       = 65536;   // 接收缓冲区大小 (64KB)
 
     Connection(socket_t fd, IOEngine* engine, BufferPool* pool,
-               Router* router = nullptr, RateLimiter* rate_limiter = nullptr);
+               Router* router = nullptr, RateLimiter* rate_limiter = nullptr,
+               std::string client_ip = "");
     ~Connection();
 
     // 禁止拷贝 (socket 所有权唯一)
@@ -67,9 +65,7 @@ public:
     Connection& operator=(const Connection&) = delete;
 
     // --- 状态查询 ---
-    ConnectionState state() const noexcept { return state_; }
     socket_t fd() const noexcept { return fd_; }
-    bool keep_alive() const noexcept { return keep_alive_; }
 
     // --- 事件处理 (由 Server/IOEngine 完成循环调用) ---
     void on_accept_complete();       // Accept 完成 → 投递第一个 recv
@@ -95,9 +91,6 @@ private:
     // 发送错误响应
     void send_error(HttpStatus status, const char* message);
 
-    // 发送预构建的 SSE 完整响应 (HTTP header + SSE body)
-    void send_sse_response(std::string_view full_response);
-
     // 构建 HTTP 响应字符串
     std::string build_http_response(HttpStatus status,
                                     const std::string& content_type,
@@ -111,15 +104,13 @@ private:
     // 转换到空闲状态 (keep-alive)
     void transition_to_idle();
 
-    // 请求 ID 生成器 (原子递增, 用于关联请求-响应)
-    static std::atomic<uint64_t> s_next_request_id;
-
     // --- 成员变量 ---
     socket_t fd_ = INVALID_SOCKET_VAL;          // 套接字
     IOEngine* engine_;                           // I/O 引擎 (不拥有)
     BufferPool* pool_;                           // 缓冲池 (不拥有)
     Router* router_ = nullptr;                   // 路由器 (不拥有)
     RateLimiter* rate_limiter_ = nullptr;        // 限流器 (不拥有)
+    std::string client_ip_;                      // 客户端 IP (用于 per-IP 限流)
     ConnectionState state_ = ConnectionState::ACCEPTED;
     HttpParser parser_;                          // HTTP 解析器状态机
     BufferHandle recv_buffer_;                   // 接收缓冲区 (RAII, 自动归还池)

@@ -1,7 +1,7 @@
 // ============================================================================
 // agent_server.cpp - Agent TCP 服务器实现
 // ============================================================================
-// 使用简化的 select()-based 事件循环 (Agent 端负载轻, 不需要 IOCP 的全部能力)
+// 使用简化的 select()-based 事件循环 (Agent 端负载轻, 不需要 io_uring 的全部能力)
 // 支持:
 //   - 多连接并发
 //   - 二进制协议帧解码 (ProtocolDecoder)
@@ -19,11 +19,7 @@ namespace agent {
 // ============================================================================
 // 构造/析构
 // ============================================================================
-AgentServer::AgentServer(uint16_t port, int worker_count)
-    : port_(port)
-    , worker_count_(worker_count)
-{
-}
+AgentServer::AgentServer(uint16_t port) : port_(port) {}
 
 AgentServer::~AgentServer() {
     stop();
@@ -92,6 +88,8 @@ void AgentServer::wait_for_shutdown() {
     while (g_running.load(std::memory_order_acquire) && running_) {
         cyrus_sleep_ms(500);
     }
+    // 主线程安全地执行信号回调 (信号处理器本身只做了原子操作)
+    drain_signal_callback();
     stop();
 }
 

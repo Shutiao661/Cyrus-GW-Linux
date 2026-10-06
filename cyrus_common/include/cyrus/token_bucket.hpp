@@ -65,16 +65,6 @@ public:
         return false;  // token 不足
     }
 
-    // 当前可用 token 数 (近似值, 用于监控)
-    double available_tokens() const {
-        const_cast<TokenBucket*>(this)->refill();
-        return tokens_.load(std::memory_order_acquire);
-    }
-
-    // 速率和容量
-    double rate() const noexcept { return rate_; }
-    double capacity() const noexcept { return capacity_; }
-
     // 动态调整速率 (用于自适应限流)
     void set_rate(double new_rate) {
         rate_.store(new_rate, std::memory_order_release);
@@ -148,9 +138,6 @@ public:
 
         return true;
     }
-
-    // 监控: 全局可用 token
-    double global_available() const { return global_.available_tokens(); }
 
 private:
     TokenBucket* get_or_create_ip_bucket(const std::string& ip) {

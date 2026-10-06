@@ -9,7 +9,7 @@
 //   5. 协调连接对象的生命周期
 //   6. 优雅关闭 (Ctrl+C → 停止接受 → 排空 → 退出)
 //
-// 架构: Proactor 模式 (IOCP/io_uring 都是此模式)
+// 架构: Proactor 模式 (io_uring)
 //   主线程: 初始化, 投递初始 Accept, 等待关闭信号
 //   工作线程: 调用 wait_completions, 分发完成事件到连接对象
 // ============================================================================
@@ -54,12 +54,6 @@ public:
     // 关闭服务器 (停止接受, 等待现有连接排空)
     void stop();
 
-    // --- 访问器 ---
-    IOEngine* engine() noexcept { return engine_.get(); }
-    BufferPool* pool() noexcept { return pool_.get(); }
-    Router* router() noexcept { return router_.get(); }
-    RateLimiter* rate_limiter() noexcept { return rate_limiter_.get(); }
-
 private:
     // --- 内部方法 ---
 
@@ -82,7 +76,7 @@ private:
     int         worker_count_;       // 工作线程数
 
     // --- I/O 基础设施 ---
-    std::unique_ptr<IOEngine> engine_;       // I/O 引擎 (IOCP)
+    std::unique_ptr<IOEngine> engine_;       // I/O 引擎 (io_uring)
     std::unique_ptr<BufferPool> pool_;       // 缓冲池
     std::unique_ptr<Router> router_;         // 路由器 + Agent 连接池
     std::unique_ptr<RateLimiter> rate_limiter_;  // 限流器
@@ -97,9 +91,8 @@ private:
     std::mutex connections_mutex_;
     std::unordered_map<socket_t, std::unique_ptr<Connection>> connections_;
 
-    // 注册/注销连接
+    // 注册连接
     void add_connection(socket_t fd, std::unique_ptr<Connection> conn);
-    void remove_connection(socket_t fd);
 
     // --- 状态 ---
     bool started_ = false;

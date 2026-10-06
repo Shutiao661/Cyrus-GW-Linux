@@ -1,7 +1,7 @@
 // ============================================================================
 // bench_epoll.cpp - epoll Edge-Triggered Reactor 基准测试 (Linux only)
 // ============================================================================
-// 与 bench_main.cpp 中的 IOCP 版本进行对等比较。
+// 与 bench_uring.cpp 中的 io_uring 版本进行对等比较。
 // 测试三种场景路径:
 //   1. PURE_ERROR:  仅返回静态错误响应 (测纯 I/O)
 //   2. AGENT_SINGLE: 通过 Agent echo handler (测 IPC 开销)
@@ -12,8 +12,6 @@
 //
 // 用法: ./bench_epoll --clients=100 --path=pure_error --duration=30
 // ============================================================================
-
-#ifdef __linux__
 
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -312,12 +310,3 @@ int main(int argc, char* argv[]) {
     print_stats(elapsed);
     return 0;
 }
-
-#else
-// Windows: 此 benchmark 仅在 Linux 上可用
-#include <cstdio>
-int main() {
-    printf("bench_epoll is Linux-only. Use bench_main for Windows IOCP benchmark.\n");
-    return 1;
-}
-#endif

@@ -1,16 +1,15 @@
 // ============================================================================
 // agent_server.hpp - Agent TCP 服务器
 // ============================================================================
-// 基于 IOCP 的 TCP 服务器, 接收 Gateway 转发的客户端请求。
+// 基于 select() 的 TCP 服务器, 接收 Gateway 转发的客户端请求。
 //
 // 架构:
 //   1. 创建监听 socket → bind → listen
-//   2. 投递 async Accept (使用 IOCP AcceptEx)
-//   3. 接受连接后投递 async Recv
-//   4. 收到数据后使用 ProtocolDecoder 解析二进制协议帧
-//   5. 解码完整的请求帧 → 分发给 RequestHandler 处理
-//   6. 将处理结果编码为响应帧 → 投递 async Send
-//   7. 发送完成后关闭连接
+//   2. select() 事件循环监听新连接与数据到达
+//   3. 接受连接后使用 ProtocolDecoder 解析二进制协议帧
+//   4. 解码完整的请求帧 → 分发给 RequestHandler 处理
+//   5. 将处理结果编码为响应帧 → send 返回给 Gateway
+//   6. 发送完成后关闭连接
 //
 // 与 Gateway 的区别:
 //   - Agent 使用简化的单连接处理模型 (每连接一个请求-响应周期)
@@ -35,7 +34,7 @@ namespace agent {
 
 class AgentServer {
 public:
-    AgentServer(uint16_t port, int worker_count = 2);
+    explicit AgentServer(uint16_t port);
     ~AgentServer();
 
     // 禁止拷贝
@@ -59,7 +58,6 @@ public:
 private:
     // --- 网络配置 ---
     uint16_t port_;
-    int worker_count_;
 
     // --- 监听 ---
     socket_t listen_fd_ = INVALID_SOCKET_VAL;
@@ -70,7 +68,7 @@ private:
 
     // --- 事件循环 ---
     // 简化实现: 使用单线程 select()-based 事件循环
-    // Agent 端负载较轻, 不需要高性能 IOCP
+    // Agent 端负载较轻, 不需要 io_uring
     void event_loop();
     void handle_new_connection();
     void handle_client_data(socket_t client_fd);

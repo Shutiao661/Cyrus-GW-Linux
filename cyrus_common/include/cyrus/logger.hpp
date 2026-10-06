@@ -6,7 +6,7 @@
 //   - 线程安全: 使用 mutex 保护输出流
 //   - C++20 std::format 风格格式化
 //   - 自动添加时间戳、日志级别、源文件位置
-//   - 可配置输出目标 (stdout / 文件) 和最低日志级别
+//   - 可配置最低日志级别, 输出到 stdout
 //
 // 使用宏:
 //   LOG_DEBUG("Received {} bytes from client {}", bytes, client_id);
@@ -50,28 +50,6 @@ public:
         min_level_ = level;
     }
 
-    // 获取当前日志级别
-    LogLevel level() const {
-        return min_level_;
-    }
-
-    // 设置输出文件 (默认: stdout)
-    // 传入 nullptr 切换到 stdout
-    // 返回 true 表示文件打开成功
-    bool set_output_file(const std::string& filepath) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (file_.has_value()) {
-            fclose(file_.value());
-            file_.reset();
-        }
-        FILE* f = fopen(filepath.c_str(), "a");  // "a" = append mode
-        if (!f) return false;
-        // 禁用缓冲, 确保日志实时写入 (对 SSE 调试尤其重要)
-        setvbuf(f, nullptr, _IONBF, 0);
-        file_ = f;
-        return true;
-    }
-
     // --- 核心日志函数 ---
     // 通常不直接调用, 使用下方的 LOG_* 宏
     // level: 日志级别
@@ -100,20 +78,11 @@ public:
 
         // 线程安全输出
         std::lock_guard<std::mutex> lock(mutex_);
-        if (file_.has_value()) {
-            fwrite(line.data(), 1, line.size(), file_.value());
-        } else {
-            fwrite(line.data(), 1, line.size(), stdout);
-        }
+        fwrite(line.data(), 1, line.size(), stdout);
     }
 
 private:
     Logger() = default;
-    ~Logger() {
-        if (file_.has_value()) {
-            fclose(file_.value());
-        }
-    }
 
     // 禁止拷贝
     Logger(const Logger&) = delete;
@@ -133,14 +102,10 @@ private:
 
         // 分解为本地时间
         struct tm local_time;
-#if CYRUS_PLATFORM_WINDOWS
-        localtime_s(&local_time, &time_t_now);
-#else
         localtime_r(&time_t_now, &local_time);
-#endif
 
         // 格式化时间戳: YYYY-MM-DD HH:MM:SS.mmm
-        char time_buf[32];
+        char time_buf[64];
         snprintf(time_buf, sizeof(time_buf),
                  "%04d-%02d-%02d %02d:%02d:%02d.%03lld",
                  local_time.tm_year + 1900,
@@ -170,7 +135,6 @@ private:
 
     LogLevel min_level_{LogLevel::DEBUG};          // 最低输出级别
     std::mutex mutex_;                              // 线程安全锁
-    std::optional<FILE*> file_{std::nullopt};       // 输出文件 (nullopt = stdout)
 };
 
 } // namespace cyrus

@@ -7,22 +7,23 @@
 #include "cyrus/gateway/sse_handler.hpp"
 #include "cyrus/logger.hpp"
 
+#include <poll.h>  // send_raw_sync 非阻塞 EAGAIN 等待可写
+
 namespace cyrus {
 namespace gateway {
-
-// 请求 ID 生成器 (从 1 开始)
-std::atomic<uint64_t> Connection::s_next_request_id{1};
 
 // ============================================================================
 // 构造/析构
 // ============================================================================
 Connection::Connection(socket_t fd, IOEngine* engine, BufferPool* pool,
-                       Router* router, RateLimiter* rate_limiter)
+                       Router* router, RateLimiter* rate_limiter,
+                       std::string client_ip)
     : fd_(fd)
     , engine_(engine)
     , pool_(pool)
     , router_(router)
     , rate_limiter_(rate_limiter)
+    , client_ip_(std::move(client_ip))
 {
     LOG_DEBUG("Connection created: fd={}", static_cast<int>(fd));
     last_activity_ = std::chrono::steady_clock::now();
@@ -39,11 +40,11 @@ Connection::~Connection() {
 // ============================================================================
 // on_accept_complete() - Accept 完成
 // ============================================================================
-// 新连接被接受后, 注册到 IOCP 并投递第一个 recv
+// 新连接被接受后, 注册到引擎并投递第一个 recv
 void Connection::on_accept_complete() {
     state_ = ConnectionState::READING_REQUEST;
 
-    // 注册此 socket 到 IOCP (这样后续的 recv/send 完成事件会路由到工作线程)
+    // 注册此 socket 到引擎 (这样后续的 recv/send 完成事件会路由到工作线程)
     engine_->register_socket(fd_, this);
 
     // 启动异步接收
@@ -240,11 +241,12 @@ void Connection::handle_request() {
     LOG_INFO("Request: {} {} from fd={}",
              http_method_to_sv(req.method), req.uri, static_cast<int>(fd_));
 
-    // --- Token Bucket 限流检查 ---
+    // --- Token Bucket 限流检查 (全局 + per-IP) ---
     if (rate_limiter_) {
-        if (!rate_limiter_->check("")) {  // TODO: 从连接中提取 client_ip
+        if (!rate_limiter_->check(client_ip_)) {
             send_error(HttpStatus::SERVICE_UNAVAILABLE, "Rate limit exceeded");
-            LOG_WARN("Rate limit exceeded for fd={}", static_cast<int>(fd_));
+            LOG_WARN("Rate limit exceeded for fd={} (ip={})",
+                     static_cast<int>(fd_), client_ip_);
             return;
         }
     }
@@ -263,17 +265,17 @@ void Connection::handle_request() {
 <head><title>Cyrus-GW</title><meta charset="utf-8"></head>
 <body>
   <h1>Cyrus-GW Gateway v2.0</h1>
-  <p>High-performance async HTTP gateway running on Windows IOCP</p>
+  <p>High-performance async HTTP gateway running on Linux io_uring</p>
   <ul>
     <li><a href="/health">GET /health</a> — Health check</li>
     <li>POST /v1/chat/completions — Chat completion (SSE streaming)</li>
   </ul>
-  <p><small>Powered by C++20 + IOCP</small></p>
+  <p><small>Powered by C++20 + io_uring</small></p>
 </body>
 </html>)";
             send_response(HttpStatus::OK, "text/html; charset=utf-8", welcome_html);
         } else if (req.method == HttpMethod::GET && req.uri == "/health") {
-            const char* health_json = R"({"status":"ok","version":"2.0.0","platform":"Windows"})";
+            const char* health_json = R"({"status":"ok","version":"2.0.0","platform":"Linux"})";
             send_response(HttpStatus::OK, "application/json", health_json);
         } else {
             send_error(HttpStatus::NOT_FOUND, "Not Found");
@@ -356,7 +358,7 @@ std::string Connection::build_http_response(HttpStatus status,
     resp += "\r\n";
 
     // 响应头
-    resp += "Server: Cyrus-GW/1.0\r\n";
+    resp += "Server: Cyrus-GW/2.0\r\n";
     resp += "Content-Type: ";
     resp += content_type;
     resp += "\r\n";
@@ -372,45 +374,6 @@ std::string Connection::build_http_response(HttpStatus status,
     resp += body;
 
     return resp;
-}
-
-// ============================================================================
-// send_sse_response() - 发送预构建的 SSE 完整响应
-// ============================================================================
-// 用于 Router 反向调用: 将预构建的 HTTP header + SSE body 直接发送
-// 与 send_response 不同: 不会在 body 前再加 HTTP header
-void Connection::send_sse_response(std::string_view full_response) {
-    // SSE 响应完成后关闭连接 (长连接转为短连接)
-    keep_alive_ = false;
-
-    // 从缓冲池获取发送缓冲区
-    send_buffer_ = pool_->acquire();
-    if (!send_buffer_ || send_buffer_.capacity() < full_response.size()) {
-        LOG_ERROR("Failed to allocate send buffer for SSE response on fd {}",
-                  static_cast<int>(fd_));
-        close();
-        return;
-    }
-
-    std::memcpy(send_buffer_.data(), full_response.data(), full_response.size());
-    send_buffer_.set_length(full_response.size());
-
-    // 投递异步 send
-    IOContext* ctx = engine_->acquire_context();
-    ctx->buffer = send_buffer_.data();
-    ctx->bytes_transferred = send_buffer_.length();
-    ctx->user_data = this;
-
-    int result = engine_->post_send(fd_, ctx);
-    if (result != 0) {
-        LOG_ERROR("Failed to post SSE send for fd {}: err={}",
-                  static_cast<int>(fd_), cyrus_socket_error());
-        engine_->release_context(ctx);
-        close();
-        return;
-    }
-
-    state_ = ConnectionState::SENDING_RESPONSE;
 }
 
 // ============================================================================
@@ -468,28 +431,42 @@ void Connection::transition_to_idle() {
 // ============================================================================
 // send_raw_sync() - 同步发送原始字节
 // ============================================================================
-// 用于 SSE 流式透传: worker 线程中 Router 同步阻塞 Agent recv,
-// 每收到一个 token 即通过此方法立即推送给客户端, 实现真正的流式响应。
-// 循环调用 ::send() 确保全部发送, 失败返回 false。
+// 用于 SSE 流式透传: 中继线程同步阻塞 Agent recv, 每收到一个 token 即
+// 通过此方法立即推送给客户端, 实现真正的流式响应。
+// 循环调用 ::send() 确保全部发送; 处理 EINTR (重试) 与 EAGAIN (等待可写)。
+// 失败返回 false。
 bool Connection::send_raw_sync(const void* data, size_t len) {
     if (fd_ == INVALID_SOCKET_VAL) return false;
 
     const char* ptr = static_cast<const char*>(data);
     size_t remaining = len;
     while (remaining > 0) {
-        int sent = ::send(fd_, ptr, static_cast<int>(remaining), 0);
-        if (sent <= 0) {
-#ifdef _WIN32
-            int err = cyrus_socket_error();
-#else
-            int err = errno;
-#endif
-            LOG_ERROR("send_raw_sync failed: fd={}, sent={}, err={}",
-                      static_cast<int>(fd_), sent, err);
+        int sent = ::send(fd_, ptr, static_cast<int>(remaining), MSG_NOSIGNAL);
+        if (sent > 0) {
+            ptr += sent;
+            remaining -= static_cast<size_t>(sent);
+            continue;
+        }
+
+        int err = errno;
+        if (err == CYRUS_EINTR) {
+            continue;  // 被信号中断, 立即重试
+        }
+        if (err == CYRUS_EWOULDBLOCK) {  // == EAGAIN (Linux)
+            // 非阻塞 socket 发送缓冲区已满 → 等待可写 (最长 1s)
+            struct pollfd pfd{};
+            pfd.fd = fd_;
+            pfd.events = POLLOUT;
+            int pr = ::poll(&pfd, 1, 1000);
+            if (pr > 0) continue;                    // 可写, 重试
+            if (pr < 0 && errno == CYRUS_EINTR) continue;  // 被信号打断, 重试
+            LOG_ERROR("send_raw_sync: poll failed fd={}, pr={}, err={}",
+                      static_cast<int>(fd_), pr, err);
             return false;
         }
-        ptr += sent;
-        remaining -= static_cast<size_t>(sent);
+        LOG_ERROR("send_raw_sync failed: fd={}, sent={}, err={}",
+                  static_cast<int>(fd_), sent, err);
+        return false;
     }
     return true;
 }

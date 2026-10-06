@@ -73,11 +73,11 @@ bool Server::start() {
         return false;
     }
 
-    // --- 第 6 步: 注册监听 socket 到 IOCP ---
+    // --- 第 6 步: 注册监听 socket ---
     // 注意: 监听 socket 的 user_data 设为 nullptr (accept completion 中判断)
     engine_->register_socket(listen_fd_, nullptr);
 
-    // --- 第 5 步: 投递初始 Accept 操作 ---
+    // --- 第 7 步: 投递初始 Accept 操作 ---
     int initial_accepts = worker_count_ * 2;  // 每个 worker 投递 2 个 accept
     for (int i = 0; i < initial_accepts; ++i) {
         if (!post_accept()) {
@@ -87,7 +87,7 @@ bool Server::start() {
     }
     LOG_INFO("Posted {} initial accept operations", initial_accepts);
 
-    // --- 第 6 步: 启动工作线程 ---
+    // --- 第 8 步: 启动工作线程 ---
     g_running.store(true);
     worker_threads_.reserve(worker_count_);
     for (int i = 0; i < worker_count_; ++i) {
@@ -113,6 +113,8 @@ void Server::wait_for_shutdown() {
         cyrus_sleep_ms(500);
     }
 
+    // 主线程安全地执行信号回调 (信号处理器本身只做了原子操作)
+    drain_signal_callback();
     LOG_INFO("Shutdown signal received");
     stop();
 }
@@ -126,16 +128,33 @@ void Server::stop() {
     LOG_INFO("Shutting down server...");
     g_running.store(false, std::memory_order_release);
 
-    // --- 第 1 步: 关闭监听 socket (停止接受新连接) ---
-    if (listen_fd_ != INVALID_SOCKET_VAL) {
-        cyrus_close_socket(listen_fd_);
-        listen_fd_ = INVALID_SOCKET_VAL;
+    // --- 第 1 步: 停止接受新连接 ---
+    // 注意: 不在此处关闭监听 socket。POSIX fallback 下 accept 线程阻塞在
+    // accept() 上, close(fd) 无法解除其阻塞; 引擎的 shutdown() 会用
+    // shutdown(SHUT_RDWR) 正确关闭监听 socket 并 join accept 线程。
+    listen_fd_ = INVALID_SOCKET_VAL;
+
+    // --- 第 2 步: 排空 SSE 中继线程 ---
+    // 中继线程持有 Connection*/AgentClient* 裸指针, 必须在销毁两者之前 join,
+    // 否则 use-after-free
+    if (router_) {
+        router_->drain_relays();
     }
 
-    // --- 第 2 步: 唤醒工作线程 ---
+    // --- 第 3 步: 关闭所有客户端 socket (仅关 fd, 对象暂不销毁) ---
+    // 关键: POSIX fallback 下 worker 线程阻塞在同步 ::recv 上, 若不先关闭 socket,
+    // join 会永久阻塞 (死锁)。close(fd) 会解除 ::recv 的阻塞 (返回 EBADF)。
+    {
+        std::lock_guard<std::mutex> lock(connections_mutex_);
+        for (auto& [fd, conn] : connections_) {
+            conn->close();
+        }
+    }
+
+    // --- 第 4 步: 唤醒工作线程 (解除 wait_completions 的阻塞) ---
     engine_->post_wakeup();
 
-    // --- 第 3 步: 等待工作线程退出 ---
+    // --- 第 5 步: 等待工作线程退出 ---
     for (auto& t : worker_threads_) {
         if (t.joinable()) {
             t.join();
@@ -144,17 +163,14 @@ void Server::stop() {
     worker_threads_.clear();
     LOG_INFO("All worker threads stopped");
 
-    // --- 第 4 步: 关闭所有连接 ---
+    // --- 第 6 步: 销毁连接对象 (worker 已全部退出, 无 use-after-free) ---
     {
         std::lock_guard<std::mutex> lock(connections_mutex_);
-        for (auto& [fd, conn] : connections_) {
-            conn->close();
-        }
         connections_.clear();
     }
     LOG_INFO("All connections closed");
 
-    // --- 第 5 步: 关闭引擎 ---
+    // --- 第 7 步: 关闭引擎 ---
     engine_->shutdown();
     engine_.reset();
 
@@ -181,7 +197,7 @@ bool Server::create_listen_socket() {
         // 非致命错误, 继续
     }
 
-    // 设置非阻塞 (IOCP 需要)
+    // 设置非阻塞 (io_uring 需要)
     cyrus_set_nonblocking(listen_fd_);
 
     // 绑定地址
@@ -300,21 +316,22 @@ void Server::on_accept_complete(IOContext* ctx) {
     // --- 第 1 步: 设置非阻塞 ---
     cyrus_set_nonblocking(client_fd);
 
-#ifdef _WIN32
-    // SO_UPDATE_ACCEPT_CONTEXT: Windows 必须! 让新 socket 继承监听 socket 属性
-    setsockopt(client_fd, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
-               reinterpret_cast<const char*>(&listen_fd_), sizeof(listen_fd_));
-#endif
-
     // --- 第 2 步: 禁用 Nagle 算法 (低延迟响应) ---
     int nodelay = 1;
     setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY,
                reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
 
+    // --- 第 2.5 步: 提取客户端 IP (per-IP 限流用) ---
+    std::string client_ip;
+    char ipbuf[INET_ADDRSTRLEN] = {0};
+    if (inet_ntop(AF_INET, &ctx->accept_addr.sin_addr, ipbuf, sizeof(ipbuf)) != nullptr) {
+        client_ip = ipbuf;
+    }
+
     // --- 第 3 步: 创建 Connection 对象 ---
     auto conn = std::make_unique<Connection>(
         client_fd, engine_.get(), pool_.get(),
-        router_.get(), rate_limiter_.get());
+        router_.get(), rate_limiter_.get(), client_ip);
 
     // --- 第 4 步: 启动连接 (注册到引擎 + 投递第一个 recv) ---
     Connection* conn_ptr = conn.get();
@@ -334,11 +351,6 @@ void Server::on_accept_complete(IOContext* ctx) {
 void Server::add_connection(socket_t fd, std::unique_ptr<Connection> conn) {
     std::lock_guard<std::mutex> lock(connections_mutex_);
     connections_[fd] = std::move(conn);
-}
-
-void Server::remove_connection(socket_t fd) {
-    std::lock_guard<std::mutex> lock(connections_mutex_);
-    connections_.erase(fd);
 }
 
 } // namespace gateway

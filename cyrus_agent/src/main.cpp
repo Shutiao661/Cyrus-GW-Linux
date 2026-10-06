@@ -1,17 +1,16 @@
 // ============================================================================
 // main.cpp - Cyrus Agent 入口点
 // ============================================================================
-// 命令行: cyrus_agent.exe [--port N] [--config file]
+// 命令行: cyrus_agent [--port N] [--config file]
 //   默认端口: 9999
 //
 // Agent 生命周期:
 //   1. 解析命令行参数
-//   2. 初始化 WSA
-//   3. 创建 AgentServer
-//   4. 注册请求处理器 (Echo + Chat)
-//   5. 启动服务器
-//   6. 等待 Ctrl+C 关闭信号
-//   7. 优雅退出
+//   2. 创建 AgentServer
+//   3. 注册请求处理器 (Echo + Chat)
+//   4. 启动服务器
+//   5. 等待 Ctrl+C 关闭信号
+//   6. 优雅退出
 // ============================================================================
 
 #include "cyrus/agent/agent_server.hpp"
@@ -22,6 +21,7 @@
 
 #include <string>
 #include <cstring>
+#include <cstdlib>
 
 using namespace cyrus;
 using namespace cyrus::agent;
@@ -44,48 +44,48 @@ int main(int argc, char* argv[]) {
     Logger::instance().set_level(LogLevel::INFO);
 
     LOG_INFO("============================================");
-    LOG_INFO("  Cyrus Agent v1.0.0");
-#if CYRUS_PLATFORM_WINDOWS
-    LOG_INFO("  Platform: Windows");
-#else
+    LOG_INFO("  Cyrus Agent v2.0.0");
     LOG_INFO("  Platform: Linux");
-#endif
     LOG_INFO("============================================");
 
     // ========================================================================
-    // 第 3 步: 初始化 WSA
-    // ========================================================================
-    WSAContext wsa;
-
-    // ========================================================================
-    // 第 4 步: 注册信号处理器
+    // 第 3 步: 注册信号处理器
     // ========================================================================
     register_signal_handler([]() {
         LOG_INFO("Agent received shutdown signal");
     });
 
     // ========================================================================
-    // 第 5 步: 创建 Agent 服务器
+    // 第 4 步: 创建 Agent 服务器
     // ========================================================================
     AgentServer server(port);
 
     // 注册请求处理器
     server.register_handler("/echo", std::make_unique<EchoHandler>());
 
-    // DeepSeek API: 真实 LLM 调用
-    auto deepseek = std::make_unique<DeepSeekProvider>(
-        "sk-6934564b14fd4a8196bfbbdcb8b83686",  // API key
-        "deepseek-chat"                           // model
-    );
-    server.register_handler("/v1/chat/completions",
-        std::make_unique<ChatHandler>(std::move(deepseek)));
-    server.register_handler("/v1/chat",
-        std::make_unique<ChatHandler>(
-            std::make_unique<DeepSeekProvider>(
-                "sk-6934564b14fd4a8196bfbbdcb8b83686", "deepseek-chat")));
+    // DeepSeek API key 从环境变量读取 (绝不硬编码进源码, 避免泄露)。
+    // 未设置 DEEPSEEK_API_KEY 时回退到 Mock provider (本地演示, 无需网络)。
+    const char* api_key_env = std::getenv("DEEPSEEK_API_KEY");
+    std::string api_key = (api_key_env != nullptr) ? api_key_env : "";
+
+    if (!api_key.empty()) {
+        auto deepseek = std::make_unique<DeepSeekProvider>(api_key, "deepseek-chat");
+        server.register_handler("/v1/chat/completions",
+            std::make_unique<ChatHandler>(std::move(deepseek)));
+        server.register_handler("/v1/chat",
+            std::make_unique<ChatHandler>(
+                std::make_unique<DeepSeekProvider>(api_key, "deepseek-chat")));
+        LOG_INFO("Registered DeepSeek chat handler (real LLM)");
+    } else {
+        server.register_handler("/v1/chat/completions",
+            std::make_unique<ChatHandler>());  // 默认 Mock provider
+        server.register_handler("/v1/chat",
+            std::make_unique<ChatHandler>());
+        LOG_WARN("DEEPSEEK_API_KEY not set — falling back to Mock LLM provider");
+    }
 
     // ========================================================================
-    // 第 6 步: 启动服务器
+    // 第 5 步: 启动服务器
     // ========================================================================
     if (!server.start()) {
         LOG_FATAL("Failed to start agent server. Exiting.");
@@ -95,7 +95,7 @@ int main(int argc, char* argv[]) {
     LOG_INFO("Agent ready. Port: {}, Handlers: echo, chat", port);
 
     // ========================================================================
-    // 第 7 步: 等待关闭信号
+    // 第 6 步: 等待关闭信号
     // ========================================================================
     server.wait_for_shutdown();
 

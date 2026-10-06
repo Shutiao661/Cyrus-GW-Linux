@@ -19,24 +19,6 @@
 #include <cstring>
 #include <string>
 
-#ifdef _WIN32
-// Windows 头文件的宏会污染 C++ 标识符, 必须 #undef
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <winsock2.h>
-#include <windows.h>
-
-#undef DELETE
-#undef OPTIONS
-#undef ERROR
-#undef SendMessage
-#undef GetMessage
-#undef GetObject
-#undef RegisterClass
-#undef IN
-#undef OUT
-#endif
-
 // 直接 include 源文件 (或者链接 gateway 库)
 // 测试中直接使用 header-only 部分
 #include "../cyrus_gateway/include/cyrus/gateway/http_parser.hpp"

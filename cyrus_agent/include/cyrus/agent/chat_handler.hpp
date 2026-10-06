@@ -36,9 +36,6 @@ class LLMProvider {
 public:
     virtual ~LLMProvider() = default;
 
-    // 返回此 provider 的名称 (如 "mock", "openai", "local")
-    virtual const char* name() const = 0;
-
     // 生成 token 序列
     // prompt: 用户输入的文本
     // 返回: SSE 格式的 chunk 列表 (每个 chunk 是一个完整的 SSE data: 行)
@@ -50,8 +47,6 @@ public:
 // ============================================================================
 class MockLLMProvider : public LLMProvider {
 public:
-    const char* name() const override { return "mock"; }
-
     std::vector<std::string> generate(const std::string& prompt) override {
         std::vector<std::string> tokens = generate_mock_tokens(prompt);
 
@@ -72,7 +67,7 @@ private:
             {"你好", "！", "我", "是", "Cyrus", "-GW", "内置", "的", "AI", "助手",
              "。", "有", "什么", "可以", "帮助", "你", "的", "吗", "？"},
             {"Cyrus", "-GW", " is", " a", " high", "-performance", " async", " HTTP",
-             " gateway", " built", " with", " C++", "20", " and", " Windows", " IOCP",
+             " gateway", " built", " with", " C++", "20", " and", " io_uring",
              ".", " It", " supports", " SSE", " streaming", " and", " binary", " protocol",
              " communication", " with", " backend", " agents", "."}
         };
@@ -130,8 +125,6 @@ public:
         std::vector<std::string> chunks = provider_->generate(user_message);
         return AgentResponse::streaming(200, chunks);
     }
-
-    const char* name() const override { return provider_->name(); }
 
 private:
     std::unique_ptr<LLMProvider> provider_;

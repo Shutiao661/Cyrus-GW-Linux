@@ -39,14 +39,6 @@ struct AgentResponse {
     bool stream = false;                           // 是否为流式响应?
     std::vector<std::string> stream_chunks;        // 流式数据块
 
-    // 工厂方法: 创建文本响应
-    static AgentResponse text(int status, std::string body) {
-        AgentResponse resp;
-        resp.status = status;
-        resp.body = std::move(body);
-        return resp;
-    }
-
     // 工厂方法: 创建 JSON 响应
     static AgentResponse json(int status, std::string json_body) {
         AgentResponse resp;
@@ -76,9 +68,6 @@ public:
     // req: 解析后的请求
     // 返回: AgentResponse
     virtual AgentResponse handle(const AgentRequest& req) = 0;
-
-    // 处理器名称 (日志用)
-    virtual const char* name() const = 0;
 };
 
 using RequestHandlerPtr = std::unique_ptr<RequestHandler>;

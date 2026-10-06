@@ -2,33 +2,29 @@
     "version": 3,
     "configurePresets": [
         {
-            "name": "debug-x64",
-            "displayName": "Debug x64 (Ninja)",
-            "description": "Ninja 生成器, x64 架构, Debug 模式",
-            "generator": "Ninja",
-            "architecture": "x64",
-            "toolset": "v180",
+            "name": "debug",
+            "displayName": "Debug (GCC)",
+            "description": "GCC 编译器, Debug 模式",
+            "generator": "Unix Makefiles",
+            "binaryDir": "${sourceDir}/build/debug",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug",
-                "CMAKE_C_COMPILER": "cl.exe",
-                "CMAKE_CXX_COMPILER": "cl.exe",
+                "CMAKE_CXX_COMPILER": "g++",
                 "BUILD_TESTS": true,
                 "BUILD_BENCHMARKS": true,
                 "USE_ASAN": false
             }
         },
         {
-            "name": "release-x64",
-            "displayName": "Release x64 (Ninja)",
-            "description": "Ninja 生成器, x64 架构, Release 优化模式",
-            "generator": "Ninja",
-            "architecture": "x64",
-            "toolset": "v180",
+            "name": "release",
+            "displayName": "Release (GCC)",
+            "description": "GCC 编译器, Release 优化模式",
+            "generator": "Unix Makefiles",
+            "binaryDir": "${sourceDir}/build/release",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release",
-                "CMAKE_C_COMPILER": "cl.exe",
-                "CMAKE_CXX_COMPILER": "cl.exe",
-                "BUILD_TESTS": false,
+                "CMAKE_CXX_COMPILER": "g++",
+                "BUILD_TESTS": true,
                 "BUILD_BENCHMARKS": true,
                 "USE_ASAN": false
             }
@@ -37,11 +33,11 @@
     "buildPresets": [
         {
             "name": "debug",
-            "configurePreset": "debug-x64"
+            "configurePreset": "debug"
         },
         {
             "name": "release",
-            "configurePreset": "release-x64"
+            "configurePreset": "release"
         }
     ]
 }

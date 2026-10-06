@@ -6,9 +6,8 @@
 add_executable(cyrus_agent
     src/main.cpp
     src/agent_server.cpp       # Agent TCP 服务器 (select-based 事件循环)
-    src/echo_handler.cpp       # Echo 处理器 (调试)
-    src/chat_handler.cpp       # Chat Completion 处理器 (模拟 LLM 流式)
 )
+# 注: echo_handler / chat_handler 为纯头文件实现 (全部 inline)
 
 # 头文件搜索路径
 target_include_directories(cyrus_agent PRIVATE

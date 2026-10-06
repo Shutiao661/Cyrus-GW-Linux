@@ -6,47 +6,12 @@
 //   - HttpMethod 枚举: HTTP 请求方法 (GET, POST, PUT, DELETE ...)
 //   - HttpStatus 枚举: HTTP 响应状态码 (200, 400, 404, 500 ...)
 //   - LogLevel 枚举: 日志级别 (DEBUG, INFO, WARN, ERROR, FATAL)
-//   - OpType 枚举: 异步操作类型 (ACCEPT, RECV, SEND ...)
-//   - BufferSlice 结构: 缓冲区的轻量引用 (指针 + 长度, 不拥有内存)
-//   - 工具函数: 枚举值 → 字符串转换, 用户数据打包
+//   - 工具函数: 枚举值 → 字符串转换
 // ============================================================================
 
 #pragma once
 
 #include "platform.hpp"
-
-// ============================================================================
-// Windows 头文件宏污染清除
-// <windows.h> 通过 <WinSock2.h> 被引入, 会定义以下与 C++ 标识符冲突的宏
-// 永久 undef — C++ 代码不使用这些 Windows 宏
-// ============================================================================
-#ifdef DELETE
-#undef DELETE
-#endif
-#ifdef OPTIONS
-#undef OPTIONS
-#endif
-#ifdef ERROR
-#undef ERROR
-#endif
-#ifdef SendMessage
-#undef SendMessage
-#endif
-#ifdef GetMessage
-#undef GetMessage
-#endif
-#ifdef GetObject
-#undef GetObject
-#endif
-#ifdef RegisterClass
-#undef RegisterClass
-#endif
-#ifdef IN
-#undef IN
-#endif
-#ifdef OUT
-#undef OUT
-#endif
 
 namespace cyrus {
 
@@ -81,8 +46,8 @@ enum class ErrorCode : uint16_t {
     E_SSE_PARSE_ERROR       = 210,  // SSE (Server-Sent Events) 解析错误
 
     // --- I/O 引擎错误 (300-399) ---
-    E_ENGINE_INIT_FAILED   = 300,   // I/O 引擎初始化失败 (如 IOCP 创建失败)
-    E_ENGINE_OP_POST_FAILED = 301,  // 异步操作投递失败 (AcceptEx/WSARecv 等返回错误)
+    E_ENGINE_INIT_FAILED   = 300,   // I/O 引擎初始化失败 (如 io_uring 队列创建失败)
+    E_ENGINE_OP_POST_FAILED = 301,  // 异步操作投递失败 (io_uring 提交返回错误)
     E_ENGINE_SHUTDOWN      = 302,   // I/O 引擎正在关闭
 
     // --- Agent 通信错误 (400-499) ---
@@ -96,39 +61,6 @@ enum class ErrorCode : uint16_t {
     E_NO_BUFFERS           = 501,   // 缓冲池耗尽 (高负载时需要增大池大小)
     E_INVALID_STATE        = 502,   // 非法的状态转换 (连接状态机逻辑错误)
 };
-
-// ---------------------------------------------------------------------------
-// error_code_to_string: 将错误码转换为可读字符串
-// 用于日志输出和 HTTP 错误响应
-// ---------------------------------------------------------------------------
-inline const char* error_code_to_string(ErrorCode code) {
-    switch (code) {
-        case ErrorCode::OK:                    return "OK";
-        case ErrorCode::E_CONNECTION_RESET:    return "Connection reset";
-        case ErrorCode::E_CONNECTION_TIMEOUT:  return "Connection timeout";
-        case ErrorCode::E_CONNECTION_REFUSED:  return "Connection refused";
-        case ErrorCode::E_ADDRESS_IN_USE:      return "Address already in use";
-        case ErrorCode::E_NETWORK_UNREACHABLE: return "Network unreachable";
-        case ErrorCode::E_HTTP_PARSE_ERROR:    return "HTTP parse error";
-        case ErrorCode::E_HTTP_BODY_TRUNCATED: return "HTTP body truncated";
-        case ErrorCode::E_HTTP_HEADER_TOO_LARGE: return "HTTP header too large";
-        case ErrorCode::E_HTTP_METHOD_INVALID: return "HTTP method invalid";
-        case ErrorCode::E_HTTP_URI_TOO_LONG:   return "HTTP URI too long";
-        case ErrorCode::E_HTTP_VERSION_INVALID:return "HTTP version not supported";
-        case ErrorCode::E_SSE_PARSE_ERROR:     return "SSE parse error";
-        case ErrorCode::E_ENGINE_INIT_FAILED:  return "I/O engine init failed";
-        case ErrorCode::E_ENGINE_OP_POST_FAILED: return "I/O engine operation post failed";
-        case ErrorCode::E_ENGINE_SHUTDOWN:     return "I/O engine shutting down";
-        case ErrorCode::E_AGENT_UNREACHABLE:   return "Agent unreachable";
-        case ErrorCode::E_AGENT_PROTOCOL_ERROR:return "Agent protocol error";
-        case ErrorCode::E_AGENT_TIMEOUT:       return "Agent timeout";
-        case ErrorCode::E_AGENT_INTERNAL_ERROR:return "Agent internal error";
-        case ErrorCode::E_INTERNAL:            return "Internal error";
-        case ErrorCode::E_NO_BUFFERS:          return "No buffers available";
-        case ErrorCode::E_INVALID_STATE:       return "Invalid state transition";
-        default:                               return "Unknown error";
-    }
-}
 
 // ============================================================================
 // HTTP 相关枚举
@@ -188,7 +120,6 @@ enum class HttpStatus : uint16_t {
     BAD_GATEWAY           = 502,   // 上游服务返回无效响应
     SERVICE_UNAVAILABLE   = 503,   // 服务暂时不可用 (过载/维护)
     GATEWAY_TIMEOUT       = 504,   // 上游服务响应超时
-    HTTP_VERSION_NOT_SUPPORTED = 505,  // 不支持的 HTTP 版本
 };
 
 // HTTP 状态码 → 原因短语 (Reason Phrase, RFC 7231)
@@ -234,77 +165,6 @@ inline const char* log_level_to_string(LogLevel level) {
         case LogLevel::FATAL: return "FATAL";
         default:              return "????";
     }
-}
-
-// ============================================================================
-// 异步操作类型 (OpType)
-// ============================================================================
-// 标识 IOCP/io_uring 完成事件对应的操作类型
-// 完成处理器根据此枚举值判断应该调用连接的哪个处理函数
-
-enum class OpType : uint8_t {
-    NONE   = 0,   // 无操作 / 未初始化
-    ACCEPT = 1,   // 接受新连接完成
-    RECV   = 2,   // 接收数据完成
-    SEND   = 3,   // 发送数据完成
-    CLOSE  = 4,   // 关闭连接
-};
-
-// ============================================================================
-// 缓冲区片 (BufferSlice)
-// ============================================================================
-// 缓冲区的轻量引用, 不拥有内存。
-// 由 BufferPool 管理实际内存, BufferSlice 只是一个带长度的指针。
-// 生命周期: BufferSlice 的生命周期必须短于其来源 BufferPool。
-
-struct BufferSlice {
-    uint8_t* data = nullptr;   // 指向缓冲区数据起始位置
-    size_t   len  = 0;         // 有效数据长度 (字节)
-
-    // 检查切片是否有有效数据
-    bool valid() const noexcept {
-        return data != nullptr && len > 0;
-    }
-
-    // 访问指定偏移处的字节
-    uint8_t operator[](size_t index) const {
-        return data[index];
-    }
-
-    // 转换为 string_view (用于 HTTP 解析等文本处理)
-    std::string_view to_sv() const {
-        return {reinterpret_cast<const char*>(data), len};
-    }
-
-    // 从 string_view 创建 BufferSlice (不复制数据, 仅引用)
-    static BufferSlice from_sv(std::string_view sv) {
-        return {const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(sv.data())), sv.size()};
-    }
-};
-
-// ============================================================================
-// 实用工具: 用户数据打包
-// ============================================================================
-// 在 IOCP 中, 每个 Overlapped 操作可以携带一个 ULONG_PTR 的 CompletionKey
-// 和 Overlapped 指针。在 io_uring 中, 每个 SQE 有 user_data (64-bit)。
-// 我们使用宏来打包/解包操作类型和操作 ID 到同一个 64-bit 整数中。
-// 高 16 位存储 OpType, 低 48 位存储自定义数据 (如连接指针或请求 ID)。
-
-using UserData = uint64_t;
-
-// 打包: 将 OpType 和 48-bit 数据合并为一个 64-bit 整数
-inline constexpr UserData make_user_data(OpType op, uint64_t data) {
-    return (static_cast<uint64_t>(static_cast<uint8_t>(op)) << 48) | (data & 0x0000FFFFFFFFFFFFULL);
-}
-
-// 解包: 提取 OpType
-inline constexpr OpType op_type_from_user_data(UserData ud) {
-    return static_cast<OpType>(static_cast<uint8_t>(ud >> 48));
-}
-
-// 解包: 提取数据部分
-inline constexpr uint64_t data_from_user_data(UserData ud) {
-    return ud & 0x0000FFFFFFFFFFFFULL;
 }
 
 } // namespace cyrus

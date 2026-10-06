@@ -5,8 +5,7 @@
 
 add_executable(cyrus_gateway
     src/main.cpp
-    src/io_engine_iocp.cpp        # IOCP 引擎 (Windows 核心实现)
-    src/io_engine_uring.cpp       # io_uring 存根 (非 Linux 平台编译用)
+    src/io_engine_uring.cpp       # io_uring 引擎 (liburing 不可用时回退 POSIX)
     src/http_parser.cpp           # HTTP/1.1 解析器状态机
     src/connection.cpp            # 连接状态机
     src/server.cpp                # 服务器主控
@@ -20,18 +19,16 @@ target_include_directories(cyrus_gateway PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
-# 链接 cyrus_common (也会自动链接 Winsock2 / pthread)
+# 链接 cyrus_common (也会自动链接 pthread)
 target_link_libraries(cyrus_gateway PRIVATE cyrus_common)
 
-# Linux: 尝试链接 liburing (可选, 用于 io_uring 引擎)
-if(NOT WIN32)
-    find_library(LIBURING_LIB uring)
-    if(LIBURING_LIB)
-        target_link_libraries(cyrus_gateway PRIVATE ${LIBURING_LIB})
-        message(STATUS "Found liburing: ${LIBURING_LIB}")
-    else()
-        message(STATUS "liburing not found — io_uring engine will use fallback")
-    endif()
+# 尝试链接 liburing (可选, 用于 io_uring 引擎)
+find_library(LIBURING_LIB uring)
+if(LIBURING_LIB)
+    target_link_libraries(cyrus_gateway PRIVATE ${LIBURING_LIB})
+    message(STATUS "Found liburing: ${LIBURING_LIB}")
+else()
+    message(STATUS "liburing not found — io_uring engine will use POSIX fallback")
 endif()
 
 # 编译器警告

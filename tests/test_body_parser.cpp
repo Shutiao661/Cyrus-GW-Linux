@@ -6,18 +6,6 @@
 #include <string>
 #include <vector>
 
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <winsock2.h>
-#include <windows.h>
-#undef DELETE
-#undef OPTIONS
-#undef ERROR
-#undef SendMessage
-#undef GetMessage
-#endif
-
 #include "../cyrus_gateway/include/cyrus/gateway/http_parser.hpp"
 
 using namespace cyrus;

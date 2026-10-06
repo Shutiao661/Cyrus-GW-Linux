@@ -1,7 +1,7 @@
 # ============================================================================
 # Cyrus-GW 根 CMakeLists.txt
 # 一个基于异步 I/O 的高性能 HTTP 网关，支持 SSE 流式响应
-# 构建: VS2022 打开此文件夹 → 选择 x64-Debug → 生成
+# 构建: cmake -B build && cmake --build build
 # ============================================================================
 cmake_minimum_required(VERSION 3.21)
 
@@ -11,7 +11,7 @@ cmake_minimum_required(VERSION 3.21)
 # - LANGUAGES CXX: 纯 C++ 项目
 # ---------------------------------------------------------------------------
 project(CyrusGW
-    VERSION 1.0.0
+    VERSION 2.0.0
     DESCRIPTION "High-performance async HTTP gateway with SSE streaming"
     LANGUAGES CXX
 )
@@ -33,12 +33,12 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # 可配置的构建选项
 option(BUILD_TESTS      "Build unit tests"      ON)
 option(BUILD_BENCHMARKS "Build benchmarks"       ON)
-option(USE_ASAN         "Enable AddressSanitizer" OFF)  # Windows 上 MSVC 用 /fsanitize=address
+option(USE_ASAN         "Enable AddressSanitizer" OFF)
 
-# AddressSanitizer 支持 (MSVC)
-if(USE_ASAN AND MSVC)
-    add_compile_options(/fsanitize=address)
-    add_link_options(/fsanitize=address)
+# AddressSanitizer 支持 (GCC/Clang)
+if(USE_ASAN)
+    add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=address)
 endif()
 
 # ============================================================================
@@ -46,15 +46,6 @@ endif()
 # ============================================================================
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(CompilerWarnings)
-
-# ============================================================================
-# Windows 网络库
-# ============================================================================
-if(WIN32)
-    # ws2_32: Winsock2 核心库 (socket, bind, listen, accept, send, recv 等)
-    # mswsock: 扩展函数 (AcceptEx, GetAcceptExSockaddrs, TransmitFile 等)
-    set(WINSOCK_LIBRARIES ws2_32 mswsock)
-endif()
 
 # ============================================================================
 # 子目录 (按依赖顺序)

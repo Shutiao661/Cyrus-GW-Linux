@@ -5,7 +5,7 @@
 //   [section]       ← 节名 (方括号, 独立一行)
 //   key = value     ← 键值对 (等号分隔, 支持行尾注释)
 //   # comment       ← 注释行 (# 开头)
-//   ; comment       ← 注释行 (; 开头, 兼容 Windows INI)
+//   ; comment       ← 注释行 (; 开头)
 //
 // 配置示例 (config/gateway.conf):
 //   [server]
@@ -34,7 +34,6 @@
 #include <unordered_map>
 #include <fstream>
 #include <sstream>
-#include <algorithm>
 #include <cctype>
 
 namespace cyrus {
@@ -56,7 +55,6 @@ public:
             LOG_ERROR("Cannot open config file: {}", filepath);
             return false;
         }
-        filepath_ = filepath;
 
         std::string current_section;  // 当前所在的节 (默认为空, 即全局节)
         int line_number = 0;
@@ -137,43 +135,6 @@ public:
         }
     }
 
-    // 获取布尔值 (带默认值)
-    // 支持: true/false, yes/no, 1/0 (不区分大小写)
-    bool get_bool(const std::string& section,
-                  const std::string& key,
-                  bool default_val = false) const
-    {
-        auto s = get(section, key, "");
-        if (s.empty()) return default_val;
-        // 转小写比较
-        std::transform(s.begin(), s.end(), s.begin(),
-                       [](unsigned char c) { return std::tolower(c); });
-        if (s == "true" || s == "yes" || s == "1") return true;
-        if (s == "false" || s == "no" || s == "0") return false;
-        LOG_WARN("Config [{}/{}]: invalid boolean '{}', using default {}",
-                 section, key, s, default_val);
-        return default_val;
-    }
-
-    // 检查节是否存在
-    bool has_section(const std::string& section) const {
-        return data_.find(section) != data_.end();
-    }
-
-    // 获取所有节名 (调试用)
-    std::vector<std::string> sections() const {
-        std::vector<std::string> result;
-        for (const auto& [name, _] : data_) {
-            result.push_back(name);
-        }
-        return result;
-    }
-
-    // 获取配置文件的路径
-    const std::string& filepath() const {
-        return filepath_;
-    }
-
 private:
     // --- 去除字符串首尾空白 ---
     static std::string trim(const std::string& s) {
@@ -187,9 +148,6 @@ private:
     // 配置数据结构: section → key → value
     std::unordered_map<std::string,
         std::unordered_map<std::string, std::string>> data_;
-
-    // 配置文件路径
-    std::string filepath_;
 };
 
 } // namespace cyrus

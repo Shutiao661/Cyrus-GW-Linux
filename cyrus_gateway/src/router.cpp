@@ -24,6 +24,9 @@ Router::Router(const Config& config) : config_(config) {
 }
 
 Router::~Router() {
+    // 先排空中继线程 (它们持有 Connection*/AgentClient* 裸指针),
+    // 再释放 Agent 连接池, 避免 use-after-free
+    drain_relays();
     // Agent 连接通过 unique_ptr 自动关闭
 }
 
@@ -89,15 +92,25 @@ AgentClient* Router::acquire_agent_client() {
         return nullptr;
     }
 
-    // Round-robin 轮询 + 健康检查: 跳过已断开或标记为不健康的连接
+    // Round-robin 轮询 + 健康检查 + 忙标记 (跳过已断开/已占用的连接)
     size_t pool_size = agent_pool_.size();
     for (size_t attempt = 0; attempt < pool_size; ++attempt) {
         size_t index = next_agent_index_ % pool_size;
         next_agent_index_++;
 
         auto& client = agent_pool_[index];
+
+        // 已被其他流式请求占用 → 跳过 (串行协议不能并发复用同一 socket)
+        if (client->is_in_use()) {
+            continue;
+        }
+
         if (client->is_connected()) {
-            return client.get();
+            // 原子抢占使用权; 失败说明发生并发竞争, 尝试下一个
+            if (client->try_acquire()) {
+                return client.get();
+            }
+            continue;
         }
 
         // 连接已断开, 尝试重连
@@ -105,24 +118,28 @@ AgentClient* Router::acquire_agent_client() {
                  index, agent_host_, agent_port_);
         if (client->connect(agent_host_, agent_port_)) {
             LOG_INFO("Agent client #{} reconnected successfully", index);
-            return client.get();
+            if (client->try_acquire()) {
+                return client.get();
+            }
         }
         LOG_WARN("Agent client #{} reconnect failed", index);
     }
 
-    // 所有连接都不健康
-    LOG_ERROR("All {} agent connections are unhealthy", pool_size);
+    // 所有连接都不健康或都被占用
+    LOG_WARN("No free agent connection (pool={} all busy or unhealthy)", pool_size);
     return nullptr;
 }
 
 void Router::release_agent_client(AgentClient* client) {
     // 连接保持打开供复用 (长连接池模式)
     // 如果连接已断开, 在下次 acquire 时自动重连
-    (void)client;
+    if (client) {
+        client->mark_idle();  // 释放忙标记, 允许其他请求复用
+    }
 
     // 定期健康检查: 每 100 次 release 触发一轮心跳
-    static int release_counter = 0;
-    if (++release_counter % 100 == 0) {
+    // 使用原子成员 (非 static 局部变量), 避免多线程下的数据竞争
+    if (release_counter_.fetch_add(1, std::memory_order_acq_rel) % 100 == 99) {
         health_check();
     }
 }
@@ -136,6 +153,13 @@ void Router::health_check() {
 
     for (size_t i = 0; i < agent_pool_.size(); ++i) {
         auto& client = agent_pool_[i];
+
+        // 正在被流式请求占用 → 视为健康, 不触碰 (避免破坏进行中的流)
+        if (client->is_in_use()) {
+            healthy++;
+            continue;
+        }
+
         if (client->is_connected()) {
             healthy++;
         } else {
@@ -191,13 +215,30 @@ h1{color:#333}code{background:#f4f4f4;padding:2px 6px;border-radius:3px}
 
 // --- 健康检查 ---
 void Router::handle_health(Connection* conn, const ParsedRequest& request) {
+    // 计算真实 uptime (秒)
+    auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - start_time_).count();
+
+    // 统计健康的 Agent 连接 (pool_mutex_ 保护, 与 acquire/health_check 一致)
+    size_t healthy_agents = 0;
+    size_t total_agents = 0;
+    {
+        std::lock_guard<std::mutex> lock(pool_mutex_);
+        total_agents = agent_pool_.size();
+        for (const auto& client : agent_pool_) {
+            // 占用中的连接正在服务流式请求, 视为健康
+            if (client->is_in_use() || client->is_connected()) {
+                healthy_agents++;
+            }
+        }
+    }
+
     std::string json = std::format(
-        R"({{"status":"ok","version":"2.0.0","platform":"{}","engine":"{}","uptime":"ok"}})",
-#if CYRUS_PLATFORM_WINDOWS
-        "Windows", "IOCP"
-#else
-        "Linux", "io_uring"
-#endif
+        R"({{"status":"ok","version":"2.0.0","platform":"Linux","engine":"{}","uptime_seconds":{},"active_relays":{},"agents":{{"healthy":{},"total":{}}}}})",
+        CYRUS_HAS_LIBURING ? "io_uring" : "io_uring(POSIX)",
+        uptime,
+        active_relays_.load(std::memory_order_acquire),
+        healthy_agents, total_agents
     );
     conn->send_response(HttpStatus::OK, "application/json", json);
 }
@@ -215,7 +256,7 @@ void Router::handle_health(Connection* conn, const ParsedRequest& request) {
 //   8. 流结束后关闭连接 (SSE 长连接不复用)
 // ============================================================================
 void Router::handle_chat_completion(Connection* conn, const ParsedRequest& request) {
-    // --- 第 1 步: 获取 Agent 连接 ---
+    // --- 第 1 步: 获取 Agent 连接 (带忙标记, 串行协议独占) ---
     AgentClient* agent = acquire_agent_client();
     if (!agent) {
         LOG_ERROR("No agent available for chat completion");
@@ -240,17 +281,71 @@ void Router::handle_chat_completion(Connection* conn, const ParsedRequest& reque
 
     if (!agent->send_packet(frame)) {
         LOG_ERROR("Failed to send request to agent");
+        release_agent_client(agent);
         conn->send_error(HttpStatus::BAD_GATEWAY,
             R"({"error":{"message":"Failed to communicate with agent","type":"gateway_error","code":502}})");
-        release_agent_client(agent);
         return;
     }
 
-    // --- 第 3 步: 初始化 SSE 中继器 + 超时配置 ---
-    SSERelayTimeout sse_timeout = SSERelayTimeout::from_config(config_);
+    // --- 第 3 步: 分发到独立中继线程 (worker 线程立即返回, 继续服务其他连接) ---
+    dispatch_relay(agent, conn, SSERelayTimeout::from_config(config_));
+}
+
+// ============================================================================
+// dispatch_relay() - 将流式聊天请求分发到独立中继线程
+// ============================================================================
+// 有界并发: 超过 max_concurrent_relays_ 直接拒绝, 不排队 (SSE 长连接不排队,
+// 避免内存/线程无界增长)。worker 线程调用, 立即返回。
+void Router::dispatch_relay(AgentClient* agent, Connection* conn,
+                            SSERelayTimeout sse_timeout) {
+    {
+        std::lock_guard<std::mutex> lock(relay_mutex_);
+
+        if (relay_shutdown_.load(std::memory_order_acquire)) {
+            release_agent_client(agent);
+            conn->send_error(HttpStatus::SERVICE_UNAVAILABLE,
+                R"({"error":{"message":"Server is shutting down","type":"gateway_error","code":503}})");
+            return;
+        }
+
+        if (active_relays_.load(std::memory_order_acquire) >= max_concurrent_relays_) {
+            LOG_WARN("Max concurrent SSE relays reached ({}), rejecting request",
+                     max_concurrent_relays_);
+            release_agent_client(agent);
+            conn->send_error(HttpStatus::SERVICE_UNAVAILABLE,
+                R"({"error":{"message":"Too many concurrent streams","type":"gateway_error","code":503}})");
+            return;
+        }
+
+        active_relays_.fetch_add(1, std::memory_order_acq_rel);
+
+        try {
+            relay_threads_.emplace_back([this, agent, conn, sse_timeout] {
+                relay_stream(agent, conn, sse_timeout);
+                active_relays_.fetch_sub(1, std::memory_order_acq_rel);
+                relay_cv_.notify_all();
+            });
+        } catch (const std::system_error& e) {
+            active_relays_.fetch_sub(1, std::memory_order_acq_rel);
+            LOG_ERROR("Failed to spawn relay thread: {}", e.what());
+            release_agent_client(agent);
+            conn->send_error(HttpStatus::SERVICE_UNAVAILABLE,
+                R"({"error":{"message":"Resource exhaustion","type":"gateway_error","code":503}})");
+        }
+    }
+}
+
+// ============================================================================
+// relay_stream() - SSE 中继线程主体
+// ============================================================================
+// 在独立线程中阻塞收取 Agent 帧并实时推送给客户端。持有 Connection*/AgentClient*
+// 裸指针, 生命周期由 Server/Router 保证 (排空在两者销毁之前完成)。
+void Router::relay_stream(AgentClient* agent, Connection* conn,
+                          SSERelayTimeout sse_timeout) {
+    // --- 初始化 SSE 中继器 ---
     SSERelayHandler relay(sse_timeout);
 
-    // --- 第 4 步: 立即发送 SSE HTTP header → 客户端可以开始接收数据 ---
+    // --- 立即发送 SSE HTTP header → 客户端可以开始接收数据 ---
     std::string sse_header = relay.build_sse_header();
     if (!conn->send_raw_sync(sse_header.data(), sse_header.size())) {
         LOG_ERROR("Failed to send SSE header, fd={}", static_cast<int>(conn->fd()));
@@ -258,42 +353,40 @@ void Router::handle_chat_completion(Connection* conn, const ParsedRequest& reque
         conn->close();
         return;
     }
-    // SSE header 已发送 → 后续错误必须通过 event: error 传递
 
-    // --- 第 5 步: 设置 ChunkedDecoder (按需启用) ---
+    // --- ChunkedDecoder (按需启用) ---
     ChunkedDecoder chunked_decoder;
     bool use_chunked = false;  // 由 MSG_RESPONSE_HEADERS 决定
 
-    // ChunkedDecoder 输出 → SSERelayHandler 输入
     chunked_decoder.on_data = [&relay](const uint8_t* data, size_t len) {
-        std::string_view clean(reinterpret_cast<const char*>(data), len);
-        relay.on_agent_data(clean);
+        relay.on_agent_data(std::string_view(reinterpret_cast<const char*>(data), len));
     };
 
-    // --- 第 6 步: SSERelayHandler 输出 → 直接推送给客户端 ---
     relay.on_send = [conn](std::string_view sse_data, bool /*is_last*/) {
         if (!sse_data.empty()) {
             conn->send_raw_sync(sse_data.data(), sse_data.size());
         }
     };
-    relay.on_close = []() {
-        // 流结束后的清理在 done_receiving 统一处理
-    };
 
-    // --- 第 7 步: Agent 响应接收循环 (逐帧处理 → 实时推送) ---
+    // --- Agent 响应接收循环 (逐帧处理 → 实时推送) ---
     std::vector<uint8_t> frame_data;
     bool stream_ok = false;
     int consecutive_recv_failures = 0;
     constexpr int MAX_CONSECUTIVE_FAILURES = 5;  // 连续失败上限
 
     while (true) {
+        // 排空标志: 关闭时尽快退出 (recv 最多阻塞 1s)
+        if (relay_shutdown_.load(std::memory_order_acquire)) {
+            LOG_DEBUG("SSE relay: shutdown requested, terminating");
+            break;
+        }
+
         if (!agent->recv_packet(frame_data, 1000)) {  // 1s 粒度 (仅控制线程阻塞)
             // recv 失败: 区分超时 (继续) vs 断开 (退出)
             if (!agent->is_connected()) {
                 LOG_WARN("Agent connection lost during SSE relay");
                 break;
             }
-            // 超时: 检查 relay 超时, 若未超时继续等待
             consecutive_recv_failures++;
             if (consecutive_recv_failures >= MAX_CONSECUTIVE_FAILURES) {
                 LOG_WARN("Agent recv consecutive failures exceeded ({})", MAX_CONSECUTIVE_FAILURES);
@@ -322,7 +415,6 @@ void Router::handle_chat_completion(Connection* conn, const ParsedRequest& reque
         switch (resp_header.msg_type) {
 
             case MessageType::MSG_RESPONSE_HEADERS: {
-                // Agent 返回响应头: 检查错误标记 + 检测 Transfer-Encoding
                 if (resp_header.flags & FrameFlags::FLAG_ERROR) {
                     relay.on_agent_error("Agent returned error status", 502);
                     goto done_receiving;
@@ -340,7 +432,6 @@ void Router::handle_chat_completion(Connection* conn, const ParsedRequest& reque
             }
 
             case MessageType::MSG_RESPONSE_DATA: {
-                // Agent 返回流式数据块
                 std::string_view chunk(
                     reinterpret_cast<const char*>(frame_data.data() + payload_offset),
                     frame_data.size() - payload_offset);
@@ -362,13 +453,11 @@ void Router::handle_chat_completion(Connection* conn, const ParsedRequest& reque
             }
 
             case MessageType::MSG_RESPONSE_END:
-                // Agent 发送流结束标记
                 relay.on_stream_complete();
                 stream_ok = true;
                 goto done_receiving;
 
             case MessageType::MSG_ERROR: {
-                // Agent 返回显式错误帧
                 std::string_view err_msg(
                     reinterpret_cast<const char*>(frame_data.data() + payload_offset),
                     frame_data.size() - payload_offset);
@@ -390,7 +479,7 @@ void Router::handle_chat_completion(Connection* conn, const ParsedRequest& reque
         }
     }
 
-    // --- 第 8 步: 循环退出 (Agent 断开/超时/recv 连续失败) ---
+    // --- 循环退出 (Agent 断开/超时/recv 连续失败/排空) ---
     if (!stream_ok && relay.is_active()) {
         relay.on_agent_error("Agent connection lost or unresponsive", 504);
     }
@@ -403,6 +492,31 @@ done_receiving:
 
     LOG_INFO("Chat completion SSE relay ended (stream_ok={}, chunked={})",
              stream_ok, use_chunked);
+}
+
+// ============================================================================
+// drain_relays() - 优雅排空所有 SSE 中继线程
+// ============================================================================
+// 设置关闭标志 → 取出所有线程 → join 直到全部结束。
+// 必须在 Server 销毁 Connection 对象之前调用 (否则中继线程访问已释放内存)。
+void Router::drain_relays() {
+    relay_shutdown_.store(true, std::memory_order_release);
+
+    std::vector<std::thread> threads;
+    {
+        std::lock_guard<std::mutex> lock(relay_mutex_);
+        threads.swap(relay_threads_);
+    }
+
+    relay_cv_.notify_all();  // 唤醒潜在等待者 (保持接口一致)
+
+    for (auto& t : threads) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+
+    LOG_INFO("SSE relay threads drained");
 }
 
 } // namespace gateway

@@ -25,12 +25,9 @@
 //
 // 平台限制:
 //   - Linux + GCC 10+/Clang 14+: 完整支持
-//   - MSVC: 部分支持 (此文件仅在 __linux__ 下编译)
 // ============================================================================
 
 #pragma once
-
-#ifdef __linux__
 
 #include "io_engine_uring.hpp"
 
@@ -246,5 +243,3 @@ inline AsyncSendAwaiter async_send(IOEngineUring* engine, socket_t fd,
 } // namespace coro
 } // namespace gateway
 } // namespace cyrus
-
-#endif // __linux__
