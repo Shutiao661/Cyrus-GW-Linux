@@ -102,8 +102,42 @@ Gateway 采用 **Proactor 模式**：由 I/O 引擎投递异步操作（`post_ac
 SSE 长连接通过**有界中继线程池**（`dispatch_relay`/`relay_stream`）解耦，避免占用 I/O worker 线程；
 关闭时优雅排空（`drain_relays`）保证 `Connection`/`AgentClient` 生命周期安全。
 
-> **关于 C++20 协程**：主链路当前基于工作线程 Proactor 实现。`coro_engine.hpp` 是实验性的
-> C++20 协程适配层（`Task<T>`/`Awaitable`），目前仅在基准测试 `bench_uring` 中使用。
+### C++20 协程层（已接通，非骨架）
+
+`coro_engine.hpp` 提供 `Task<T>` / `co_await` 接口，**完成事件 → 协程恢复的链路是通的**，
+由 `tests/test_coro.cpp` 覆盖（ASAN 下同样通过）：
+
+```
+co_await async_recv(fd, buf)
+   │  await_suspend: 填充 ctx → post_recv() 投递 SQE, 协程挂起
+   │  引擎把 ctx 指针编码进 sqe->user_data (高 8 位操作类型 + 低 56 位指针)
+   ▼
+wait_completions() 收割 CQE → 解码出 ctx → 填充 bytes_transferred/error
+   │  发现 ctx->on_complete 非空 → 调用回调
+   ▼
+回调经 ctx->user_data 找回 awaiter → continuation.resume() → 从 await_resume() 继续
+```
+
+**恢复发生在收割该 CQE 的那个 I/O 线程上，不做跨线程投递**：省掉每次 I/O 的入队 + 唤醒开销，
+协程帧也只被一个线程访问、无需加锁；代价是协程体不能长时间占 CPU（否则会拖住该 worker 收割其他
+完成事件），所以协程要在每个 I/O 边界让出。
+
+已处理的坑（都在测试里有对应断言）：
+- **协程帧生命周期**：`detach()` 的 fire-and-forget 任务在 `final_suspend` 自毁，不泄漏帧；
+  「帧已销毁」由帧上局部对象的析构标志验证。
+- **对称转移**：`co_await Task` 通过 `await_suspend` 返回子协程句柄，而不是在 `await_suspend`
+  里 `resume()` —— 后者会让父协程在子协程的栈上继续执行，父协程一销毁就悬垂。
+- **投递失败不能挂死**：`post_recv/post_send` 失败时立刻恢复协程（`h.resume()` 必须是最后一条语句，
+  恢复后帧可能已销毁）。
+- **POSIX 分支的锁**：完成回调必须在 `completion_mutex_` 之外触发，否则恢复的协程紧接着
+  `post_recv` 重新取同一把锁会自死锁。
+
+`coro_session.hpp` 是基于它的连接处理参考实现（收 → 解析 → 应答，半包保持状态、粘包字节不丢），
+与 `Connection` 是同一件事的协程写法。
+
+> 现状：协程链路已接通并有测试覆盖，但**网关主链路仍走 `Connection`（线程 + 完成事件分发）**。
+> 把连接处理切到协程需要先在装了 `liburing` 的环境做等价性验证 —— 无 liburing 时引擎走 POSIX
+> fallback，`post_recv` 是同步阻塞实现，协程退化为「阻塞 + 挂起」，验证不出真实异步行为。
 
 ### Gateway ↔ Agent 二进制帧协议
 
@@ -332,7 +366,8 @@ Cyrus-GW/
 │   │   ├── sse_handler.hpp        # SSE 中继 + 三层超时
 │   │   ├── io_engine.hpp          # I/O 引擎抽象
 │   │   ├── io_engine_uring.hpp    # io_uring 引擎 (POSIX fallback)
-│   │   ├── coro_engine.hpp        # 实验性 C++20 协程适配层
+│   │   ├── coro_engine.hpp        # C++20 协程适配层 (Task/Awaitable, 已接通)
+│   │   ├── coro_session.hpp       # 协程版连接处理 (参考实现)
 │   │   └── agent_client.hpp       # Agent TCP 客户端 (CAS 忙标记)
 │   └── src/
 │       ├── main.cpp
@@ -353,7 +388,7 @@ Cyrus-GW/
 │   └── src/
 │       ├── main.cpp
 │       └── agent_server.cpp
-├── tests/                         # 测试（8 单元 + 1 集成）
+├── tests/                         # 测试（9 单元 + 1 集成）
 └── benchmark/                     # 基准测试
     ├── bench_epoll.cpp            # epoll Reactor 基线
     ├── bench_uring.cpp            # io_uring + C++20 协程版
@@ -379,6 +414,7 @@ Cyrus-GW/
 | `test_sse_error` | 测试 | SSE 错误处理 |
 | `test_buffer` | 测试 | 缓冲池 |
 | `test_token_bucket` | 测试 | Token Bucket 限流 |
+| `test_coro` | 测试 | 协程 ↔ 完成事件链路（resume、帧生命周期、半包） |
 | `integration_test` | 集成测试 | 启动 Agent + Gateway，curl 验证 `/health` 与 SSE 流 |
 | `cyrus_bench_epoll` | 基准测试 | epoll Reactor 基线 |
 | `cyrus_bench_uring` | 基准测试 | io_uring + 协程版（需 liburing） |
@@ -388,7 +424,7 @@ Cyrus-GW/
 ## 测试
 
 ```bash
-# 构建并运行全部测试（8 单元 + 1 集成）
+# 构建并运行全部测试（9 单元 + 1 集成）
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 
@@ -437,7 +473,7 @@ ctest --test-dir build --output-on-failure
 |------|------|
 | C++20 | 核心语言（`std::format`、`std::source_location`、concepts） |
 | io_uring | Linux 异步 I/O 引擎（无 liburing 时 POSIX fallback） |
-| C++20 Coroutines | 实验性协程适配层（benchmark 使用） |
+| C++20 Coroutines | 协程适配层 `Task<T>`/`Awaitable`（链路已接通，测试覆盖） |
 | CMake + Ninja/Make | 构建系统 |
 | SSE | 流式推送协议（OpenAI 兼容） |
 | TCP | Gateway ↔ Agent 二进制帧协议 |

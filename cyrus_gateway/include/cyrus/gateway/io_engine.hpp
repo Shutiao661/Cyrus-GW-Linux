@@ -50,6 +50,14 @@ struct IOContext {
     int          error = 0;               // 完成时: 0=成功, 非0=错误码
     void*        user_data = nullptr;      // 用户数据 (通常指向 Connection 对象)
 
+    // 完成回调 (协程路径专用)
+    //   非空: wait_completions() 填好 bytes_transferred/error 后直接回调,
+    //         由回调恢复 (resume) 挂起的协程, 该上下文不再返回给上层分发。
+    //   为空: 传统路径 —— 上下文返回给调用者 (Server 按 op 类型分发)。
+    // 用裸函数指针而非 std::function: 回调在每次 I/O 完成时都要走一遍,
+    // 不能引入堆分配。
+    void (*on_complete)(IOContext*) = nullptr;
+
     // Accept 完成: 对端客户端地址 (用于 per-IP 限流等)
     sockaddr_in  accept_addr{};
     socklen_t    accept_addr_len = sizeof(sockaddr_in);
@@ -64,6 +72,7 @@ struct IOContext {
         bytes_transferred = 0;
         error = 0;
         user_data = nullptr;
+        on_complete = nullptr;
         accept_addr = sockaddr_in{};
         accept_addr_len = sizeof(sockaddr_in);
     }

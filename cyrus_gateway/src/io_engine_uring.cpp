@@ -296,34 +296,56 @@ int IOEngineUring::wait_completions(IOContext** contexts, int max_events,
         if (UringContext::decode_op(cqe->user_data) == IOOperation::ACCEPT && cqe->res >= 0) {
             ctx->accept_fd = static_cast<socket_t>(cqe->res);
         }
-        contexts[count++] = ctx;
+        // CQE 先归还内核再回调: 回调里恢复的协程会立刻投递下一个操作
         io_uring_cqe_seen(&ring_, cqe);
+
+        // 协程路径: 回调内 resume 挂起的协程。恢复后协程可能立即
+        // 结束并销毁自己的帧 (detach 的任务), 因此回调返回后不得再访问 ctx。
+        if (ctx->on_complete) {
+            ctx->on_complete(ctx);
+            continue;
+        }
+
+        contexts[count++] = ctx;
     }
     return count;
 #else
     // POSIX fallback: 从完成队列取事件
     if (shutting_down_.load(std::memory_order_acquire)) return 0;
 
-    std::unique_lock<std::mutex> lk(completion_mutex_);
-    if (completion_queue_.empty()) {
-        if (timeout_ms < 0) {
-            completion_cv_.wait(lk, [this]() {
-                return !completion_queue_.empty() ||
-                       shutting_down_.load(std::memory_order_acquire);
-            });
-        } else if (timeout_ms > 0) {
-            completion_cv_.wait_for(lk, std::chrono::milliseconds(timeout_ms),
-                [this]() { return !completion_queue_.empty(); });
+    std::vector<IOContext*> ready;
+    {
+        std::unique_lock<std::mutex> lk(completion_mutex_);
+        if (completion_queue_.empty()) {
+            if (timeout_ms < 0) {
+                completion_cv_.wait(lk, [this]() {
+                    return !completion_queue_.empty() ||
+                           shutting_down_.load(std::memory_order_acquire);
+                });
+            } else if (timeout_ms > 0) {
+                completion_cv_.wait_for(lk, std::chrono::milliseconds(timeout_ms),
+                    [this]() { return !completion_queue_.empty(); });
+            }
+            // timeout_ms == 0: 不等待, 直接返回
         }
-        // timeout_ms == 0: 不等待, 直接返回
+
+        if (shutting_down_.load(std::memory_order_acquire)) return 0;
+
+        while (!completion_queue_.empty() &&
+               static_cast<int>(ready.size()) < max_events) {
+            ready.push_back(completion_queue_.front());
+            completion_queue_.pop_front();
+        }
     }
-
-    if (shutting_down_.load(std::memory_order_acquire)) return 0;
-
+    // 必须在锁外分发: 协程回调会恢复协程, 而协程紧接着会再次投递操作
+    // (POSIX 的 post_recv 要重新获取 completion_mutex_, 持锁回调会自死锁)。
     int count = 0;
-    while (!completion_queue_.empty() && count < max_events) {
-        contexts[count++] = completion_queue_.front();
-        completion_queue_.pop_front();
+    for (IOContext* ctx : ready) {
+        if (ctx->on_complete) {
+            ctx->on_complete(ctx);   // 协程路径: 回调返回后 ctx 可能已被销毁
+            continue;
+        }
+        contexts[count++] = ctx;
     }
     return count;
 #endif

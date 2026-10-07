@@ -46,6 +46,22 @@ target_include_directories(test_sse_error PRIVATE
 set_compiler_warnings(test_sse_error)
 add_test(NAME test_sse_error COMMAND test_sse_error)
 
+# test_coro 需要链接 io_engine_uring.cpp (IOEngineUring) + http_parser.cpp
+# (协程 session 里会解析 HTTP) 与 gateway 头文件
+# 验证: 完成事件 → 协程 resume 链路、协程帧生命周期、continuation
+add_executable(test_coro test_coro.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cyrus_gateway/src/io_engine_uring.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cyrus_gateway/src/http_parser.cpp)
+target_link_libraries(test_coro PRIVATE cyrus_common)
+target_include_directories(test_coro PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cyrus_gateway/include)
+find_library(LIBURING_LIB_TEST uring)
+if(LIBURING_LIB_TEST)
+    target_link_libraries(test_coro PRIVATE ${LIBURING_LIB_TEST})
+endif()
+set_compiler_warnings(test_coro)
+add_test(NAME test_coro COMMAND test_coro)
+
 # test_body_parser 需要链接 http_parser.cpp 实现
 add_executable(test_body_parser test_body_parser.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../cyrus_gateway/src/http_parser.cpp)
