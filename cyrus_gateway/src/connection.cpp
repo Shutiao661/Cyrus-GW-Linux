@@ -15,11 +15,12 @@ namespace gateway {
 // ============================================================================
 // 构造/析构
 // ============================================================================
-Connection::Connection(socket_t fd, IOEngine* engine, BufferPool* pool,
+Connection::Connection(uint64_t conn_id, socket_t fd, IOEngine* engine, BufferPool* pool,
                        Router* router, RateLimiter* rate_limiter,
                        std::string client_ip,
                        size_t max_keepalive_requests, size_t max_header_size)
-    : fd_(fd)
+    : id_(conn_id)
+    , fd_(fd)
     , engine_(engine)
     , pool_(pool)
     , router_(router)
@@ -59,6 +60,13 @@ void Connection::on_accept_complete() {
 // ============================================================================
 // 从缓冲池获取一个缓冲区, 投递异步 recv
 void Connection::start_reading() {
+    // 已关闭的连接不得再投递 I/O。
+    // io_uring 下 post_recv 是异步的: 即使 fd 已经无效, 提交的 SQE 仍会挂在
+    // ring 里, 之后带着"已销毁的 Connection*"完成 (user_data), 造成 use-after-free。
+    if (fd_ == INVALID_SOCKET_VAL) {
+        return;
+    }
+
     // Body 读取超时检测: 如果长时间停留在 BODY/CHUNK 状态, 主动关闭
     auto now = std::chrono::steady_clock::now();
     if (parser_.state() == ParseState::BODY ||
@@ -292,6 +300,11 @@ void Connection::handle_request() {
 void Connection::send_response(HttpStatus status,
                                 const std::string& content_type,
                                 std::string_view body) {
+    // 同 start_reading: 关闭后不再投递 (否则异步完成会引用已释放的对象)
+    if (fd_ == INVALID_SOCKET_VAL) {
+        return;
+    }
+
     std::string response = build_http_response(status, content_type, body, keep_alive_);
 
     // 从缓冲池获取发送缓冲区

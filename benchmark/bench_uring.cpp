@@ -100,9 +100,8 @@ public:
 
 private:
     void run() {
-        // 投递初始 accept
-        UringContext accept_ctx;
-        engine_.post_accept(listen_fd_, &accept_ctx);
+        // 投递初始 accept (堆分配: 完成时由 handle_accept 释放)
+        engine_.post_accept(listen_fd_, new UringContext());
 
         constexpr int MAX_EVENTS = 256;
         IOContext* completions[MAX_EVENTS];
@@ -121,8 +120,7 @@ private:
                         handle_recv(ctx);
                         break;
                     case IOOperation::SEND:
-                        // 发送完成, 可以关闭或继续
-                        close(ctx->fd);
+                        handle_send(ctx);
                         break;
                     default:
                         break;
@@ -132,30 +130,45 @@ private:
     }
 
     void handle_accept(IOContext* ctx) {
-        // 新连接 → 投递 recv
-        UringContext* recv_ctx = new UringContext();  // 简化: 每个连接分配独立上下文
+        // 注意: ACCEPT 完成时监听 fd 在 ctx->fd, 新连接的 fd 在 ctx->accept_fd。
+        // 用 ctx->fd 会在监听 socket 上投递 recv (失败后还会把它关掉)。
+        const socket_t client_fd = ctx->accept_fd;
+        delete static_cast<UringContext*>(ctx);
+
+        if (client_fd == INVALID_SOCKET_VAL) return;
+
+        UringContext* recv_ctx = new UringContext();  // 简化: 每连接一个上下文
         recv_ctx->buffer = new uint8_t[4096];
         recv_ctx->buffer_len = 4096;
-        engine_.post_recv(ctx->fd, recv_ctx);
+        engine_.post_recv(client_fd, recv_ctx);
 
-        // 重新投递 accept
-        UringContext* next_ctx = new UringContext();
-        engine_.post_accept(listen_fd_, next_ctx);
+        // 重新投递 accept, 保持队列里有待接受的连接
+        engine_.post_accept(listen_fd_, new UringContext());
     }
 
     void handle_recv(IOContext* ctx) {
+        auto* recv_ctx = static_cast<UringContext*>(ctx);
         if (ctx->bytes_transferred > 0) {
-            // Echo: 收到数据 → 原样返回
-            UringContext* send_ctx = new UringContext();
-            send_ctx->buffer = ctx->buffer;
+            // Echo: 借用接收缓冲发回, 发完再继续收 (连接保持)
+            auto* send_ctx = new UringContext();
+            send_ctx->buffer = recv_ctx->buffer;
             send_ctx->bytes_transferred = ctx->bytes_transferred;
+            send_ctx->user_data = recv_ctx;      // 记住缓冲归属
             engine_.post_send(ctx->fd, send_ctx);
         } else {
             // 连接关闭
-            close(ctx->fd);
-            delete[] ctx->buffer;
-            delete static_cast<UringContext*>(ctx);
+            ::close(ctx->fd);
+            delete[] recv_ctx->buffer;
+            delete recv_ctx;
         }
+    }
+
+    void handle_send(IOContext* ctx) {
+        auto* send_ctx = static_cast<UringContext*>(ctx);
+        auto* recv_ctx = static_cast<UringContext*>(send_ctx->user_data);
+        const socket_t fd = ctx->fd;
+        delete send_ctx;                         // 发送上下文用完即弃
+        engine_.post_recv(fd, recv_ctx);         // 复用接收上下文收下一个请求
     }
 
     IOEngineUring engine_;
@@ -252,6 +265,7 @@ int main(int argc, char* argv[]) {
         if (arg.starts_with("--clients=")) g_config.clients = std::stoi(arg.substr(10));
         else if (arg.starts_with("--duration=")) g_config.duration = std::stoi(arg.substr(11));
         else if (arg.starts_with("--path=")) g_config.path = arg.substr(7);
+        else if (arg.starts_with("--port=")) g_config.port = std::stoi(arg.substr(7));
     }
 
     printf("========================================\n");

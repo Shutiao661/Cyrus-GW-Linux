@@ -76,8 +76,6 @@ bool Server::start() {
     if (!router_->init()) {
         LOG_WARN("Router: agent backend may not be available (non-fatal)");
     }
-    // 流式连接在中继结束后由中继线程摘除 (它是这条连接的最后使用者)
-    router_->set_connection_reaper([this](socket_t fd) { remove_connection(fd); });
 
     // --- 第 5 步: 创建监听 socket ---
     if (!create_listen_socket()) {
@@ -304,18 +302,10 @@ void Server::worker_loop(int worker_id) {
                     // user_data 指向 Connection 对象
                     Connection* conn = static_cast<Connection*>(ctx->user_data);
                     if (conn) {
-                        // 每个连接同一时刻只有一个挂起的操作, 因此本线程
-                        // 处理完这个完成事件后即成为该连接的最后使用者
-                        socket_t conn_fd = ctx->fd;
                         if (ctx->op == IOOperation::RECV) {
                             conn->on_recv_complete(ctx);
                         } else {
                             conn->on_send_complete(ctx);
-                        }
-                        // 已关闭且无中继线程持有 → 摘除并销毁 (修复连接对象泄漏)。
-                        // remove_connection 之后不得再访问 conn。
-                        if (conn->is_closed() && !conn->is_streaming()) {
-                            remove_connection(conn_fd);
                         }
                     }
                     break;
@@ -375,15 +365,16 @@ void Server::on_accept_complete(IOContext* ctx) {
         client_ip = ipbuf;
     }
 
-    // --- 第 4 步: 创建 Connection 对象 (带上配置的连接级上限) ---
-    auto conn = std::make_unique<Connection>(
-        client_fd, engine_.get(), pool_.get(),
+    // --- 第 4 步: 创建 Connection 对象 (分配唯一 id, 带上配置的连接级上限) ---
+    const uint64_t conn_id = next_connection_id_.fetch_add(1, std::memory_order_relaxed);
+    auto conn = std::make_shared<Connection>(
+        conn_id, client_fd, engine_.get(), pool_.get(),
         router_.get(), rate_limiter_.get(), client_ip,
         max_keepalive_requests_, max_header_size_);
 
     // --- 第 5 步: 启动连接 (注册到引擎 + 投递第一个 recv) ---
     Connection* conn_ptr = conn.get();
-    add_connection(client_fd, std::move(conn));
+    add_connection(conn_id, std::move(conn));
     conn_ptr->on_accept_complete();
 
     // --- 第 6 步: 归还 Accept 上下文 ---
@@ -396,20 +387,18 @@ void Server::on_accept_complete(IOContext* ctx) {
 // ============================================================================
 // 连接管理
 // ============================================================================
-void Server::add_connection(socket_t fd, std::unique_ptr<Connection> conn) {
+void Server::add_connection(uint64_t conn_id, std::shared_ptr<Connection> conn) {
     std::lock_guard<std::mutex> lock(connections_mutex_);
-    connections_[fd] = std::move(conn);
+    connections_[conn_id] = std::move(conn);
 }
 
 // 摘除并销毁连接。只允许"最后使用者"调用:
 //   - 处理完该连接完成事件的 worker 线程
 //   - 持有该连接的 SSE 中继线程 (排空时保证已 join)
-void Server::remove_connection(socket_t fd) {
+void Server::remove_connection(uint64_t conn_id) {
     std::lock_guard<std::mutex> lock(connections_mutex_);
-    size_t erased = connections_.erase(fd);
-    LOG_DEBUG("Connection removed: fd={}, active={}", static_cast<int>(fd),
-              connections_.size());
-    (void)erased;
+    connections_.erase(conn_id);
+    LOG_DEBUG("Connection removed: id={}, active={}", conn_id, connections_.size());
 }
 
 // 是否已达连接数上限。加锁读取, 与 add_connection/remove_connection 保持一致。
@@ -435,24 +424,22 @@ void Server::sweeper_loop() {
 // 在锁内挑出候选 (只读), 在锁外关闭 —— 避免在持锁期间调用 close()。
 // 正在被 SSE 中继持有的连接跳过: 长流可能长时间没有数据, 但它并不是空闲。
 void Server::sweep_idle_connections() {
-    std::vector<Connection*> expired;
+    // 持引用收集候选, 锁外关闭: 引用保证关闭期间对象不会被别处销毁
+    std::vector<std::shared_ptr<Connection>> expired;
     {
         std::lock_guard<std::mutex> lock(connections_mutex_);
-        for (auto& [fd, conn] : connections_) {
+        for (auto& [id, conn] : connections_) {
             if (conn->is_closed() || conn->is_streaming()) continue;
             if (conn->idle_ms() > keepalive_timeout_ms_) {
-                expired.push_back(conn.get());
+                expired.push_back(conn);
             }
         }
     }
 
-    for (Connection* conn : expired) {
-        socket_t fd = conn->fd();
-        LOG_DEBUG("Keep-alive timeout: fd={}, idle={}ms",
-                  static_cast<int>(fd), conn->idle_ms());
-        // 只关闭, 不在此处销毁: 该连接可能仍有挂起的 recv,
-        // 销毁由处理那个完成事件的 worker 线程完成 (它会看到 is_closed())。
-        conn->on_timeout();
+    for (const auto& conn : expired) {
+        LOG_DEBUG("Keep-alive timeout: id={}, fd={}, idle={}ms",
+                  conn->id(), static_cast<int>(conn->fd()), conn->idle_ms());
+        conn->on_timeout();   // 关闭 fd (对象留到 Server::stop() 统一销毁)
     }
 }
 

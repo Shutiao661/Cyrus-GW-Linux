@@ -27,6 +27,7 @@
 - [测试](#测试)
 - [基准测试](#基准测试)
 - [技术栈](#技术栈)
+- [已知限制](#已知限制)
 - [License](#license)
 
 ---
@@ -447,23 +448,33 @@ ctest --test-dir build --output-on-failure
 
 ## 基准测试
 
-对比 **epoll Reactor** 与 **io_uring + C++20 协程** 两种并发模型：
+对比 **epoll Reactor** 与 **io_uring** 两种并发模型（两者的 echo server 都是单线程事件循环，可直接对照）：
 
 ```bash
-# 运行测试矩阵（引擎: epoll/uring，并发: 100/300/500，路径: pure_error/agent_single/full_chain）
-./benchmark/run_bench.sh both
+./build/uring/benchmark/cyrus_bench_epoll  --clients=500 --duration=8
+./build/uring/benchmark/cyrus_bench_uring  --clients=500 --duration=8
 ```
 
-三种对照路径用于瓶颈定位：
+**实测（本机，echo 负载，8 秒，单次测量）：**
 
-| 路径 | 配置 | 目的 |
-|------|------|------|
-| `pure_error` | Gateway 直接返回错误，不调用 Agent | 隔离 I/O 层性能天花板 |
-| `agent_single` | 仅 1 个 Agent worker | 隔离业务层开销 |
-| `full_chain` | Gateway → Agent → LLM 全链路 | 端到端真实场景 |
+| 并发 | epoll | io_uring |
+|------|-------|----------|
+| c=100 | 185,011 req / 37.0k RPS / P99 3.9ms | 176,774 req / 35.4k RPS / P99 4.3ms |
+| c=500 | 279,487 req / 34.9k RPS / P99 20.7ms | 253,694 req / 31.7k RPS / P99 23.3ms |
 
-> 结论（c=500）：io_uring 完成请求数为 epoll 的 **2.15×**；瓶颈在 Agent/LLM 调用侧，而非 Gateway I/O 层。
-> 故性能优化优先投入 Agent/LLM 链路。
+两个引擎在这台机器上**基本持平**（io_uring 略低 5%~10%）。注意这是 echo 负载，不含 Agent / LLM 环节。
+
+> ⚠️ 早期文档里「c=500 时 io_uring 完成请求数是 epoll 的 2.15×」的说法**目前无法复现**：既没有当时的脚本，也没有留下原始数据。另外 `--path=pure_error|agent_single|full_chain` 三个取值当前**不改变实际负载**（只影响打印），因此那三行数据等价，不能用于瓶颈定位。需要真实链路对比时，应先把 `--path` 实现成不同工作负载（或直接用 wrk 打真实网关）。
+
+---
+
+## 已知限制
+
+1. **POSIX fallback 的并发上限 ≈ `worker_threads`**（已在开头说明）：无 liburing 时 recv/send 在工作线程里同步阻塞，一条连接会占住一个 worker。压测请装 liburing。
+2. **连接对象运行期不回收**：只关闭 socket 与缓冲，`Connection` 对象保留到关机统一销毁。原因是"无人引用"难以可证明地判定 —— worker（完成事件）、SSE 中继线程、空闲扫描线程三方都可能持有裸指针，而 `ctx->user_data` 指向对象、完成事件可能在任意时刻到达。试过三种销毁方案（worker 侧摘除 / 中继侧摘除 / 扫描线程统一摘除 + 在途计数），都在压力下出现 use-after-free（ASAN 实测），因此改为保守策略。代价是对象常驻内存（约百余字节/连接）。彻底解决需要换所有权模型（每连接单一所有者线程，或让引用计数句柄随完成事件传递）。
+3. **协程仍是并行路径，不是主链路**：`coro_engine.hpp` / `coro_session.hpp` 已接通并有测试覆盖（含真 io_uring），但网关连接处理仍走 `Connection`（线程 + 完成事件分发）。
+4. **基准的 `--path` 不改变负载**（见上）。
+5. **`io_uring` 引擎的 SQ/CQ 用一把互斥锁串行化**：liburing 的 `io_uring_get_sqe()`/`io_uring_submit()` 不是线程安全的，多 worker 共享一个 ring 必须序列化，否则 SQE 会被覆盖、完成事件与操作错配（实测表现为 accept 完成里解析出别的操作）。更彻底的做法是每线程独立 ring（`IORING_SETUP_SQPOLL`/`ATTACH_WQ`）。
 
 ---
 

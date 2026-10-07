@@ -48,7 +48,7 @@ enum class ConnectionState : uint8_t {
 // ============================================================================
 // Connection - 连接对象
 // ============================================================================
-class Connection {
+class Connection : public std::enable_shared_from_this<Connection> {
     friend class Router;  // Router 需要访问 send_response/send_error
 public:
     // --- 配置常量 ---
@@ -56,7 +56,10 @@ public:
     static constexpr int    BODY_READ_TIMEOUT_MS   = 30000;   // 请求体读取超时 (30秒)
     static constexpr size_t MAX_KEEPALIVE_REQUESTS = 1000;    // keep-alive 最大请求数
 
-    Connection(socket_t fd, IOEngine* engine, BufferPool* pool,
+    // conn_id: 连接的唯一标识, 由 Server 分配 (单调递增)。
+    // 不能用 fd 当标识: close() 之后内核会立刻复用该 fd 号, 而连接对象可能
+    // 还没被摘除 —— 用 fd 做主键会让新连接覆盖(析构)仍在被使用的旧连接。
+    Connection(uint64_t conn_id, socket_t fd, IOEngine* engine, BufferPool* pool,
                Router* router = nullptr, RateLimiter* rate_limiter = nullptr,
                std::string client_ip = "",
                size_t max_keepalive_requests = MAX_KEEPALIVE_REQUESTS,
@@ -67,12 +70,28 @@ public:
     Connection(const Connection&) = delete;
     Connection& operator=(const Connection&) = delete;
 
+    // --- 生命周期 ---
+    // 连接对象由 Server 的连接表 (shared_ptr) 持有, 一直存活到 Server::stop()
+    // 统一销毁; 中继线程在流式期间另持一份引用。
+    // 运行期不销毁对象, 是因为"无人引用"难以可证明地判定: worker (完成事件)、
+    // 中继线程、扫描线程三方都可能持有裸指针, 而 ctx->user_data 指向对象、
+    // 完成事件可能在任意时刻到达。实际尝试过三种销毁方案 (worker 侧摘除 /
+    // 中继侧摘除 / 扫描线程统一摘除 + 在途计数), 都在压力下出现 use-after-free
+    // (ASAN 实测), 因此改为保守策略: 只关闭连接 (fd 与缓冲立即释放),
+    // 对象本身留到关机时统一销毁。
+    // 代价: 对象常驻内存 (约百余字节/连接), 长跑会单调增长。
+    // 彻底解决需要换所有权模型 (例如每连接一个由单一线程驱动的状态机,
+    // 或把引用计数句柄随完成事件一起传递), 属后续工作。
+
     // --- 状态查询 ---
     socket_t fd() const noexcept { return fd_; }
+    uint64_t id() const noexcept { return id_; }   // 连接表主键 (非 fd)
     bool is_closed() const noexcept { return fd_ == INVALID_SOCKET_VAL; }
 
     // 空闲时长 (毫秒, 自最后一次收发算起) — keep-alive 超时扫描用
     int64_t idle_ms() const;
+
+
 
     // --- SSE 中继标记 ---
     // 中继线程持有此连接期间为 true。worker 与空闲扫描线程据此跳过
@@ -119,6 +138,7 @@ private:
     void transition_to_idle();
 
     // --- 成员变量 ---
+    uint64_t id_;                                // 唯一标识 (连接表主键)
     socket_t fd_ = INVALID_SOCKET_VAL;          // 套接字
     IOEngine* engine_;                           // I/O 引擎 (不拥有)
     BufferPool* pool_;                           // 缓冲池 (不拥有)

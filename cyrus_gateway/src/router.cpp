@@ -331,19 +331,18 @@ void Router::dispatch_relay(AgentClient* agent, Connection* conn,
 
         // 在 spawn 之前打上中继标记: dispatch_relay 返回后 worker 线程会检查
         // 这条连接能否销毁, 标记必须先于中继线程存在。
-        const socket_t conn_fd = conn->fd();
+        // 中继线程整个生命周期持有一份引用。连接表项的摘除与对象销毁统一由
+        // Server 的扫描线程负责 (条件: 已关闭 && 非中继中 && 无在途操作),
+        // 中继这里既不摘表项也不销毁, 避免与 worker 的收尾竞争。
+        std::shared_ptr<Connection> conn_ref = conn->shared_from_this();
         conn->mark_streaming();
 
         try {
-            relay_threads_.emplace_back([this, agent, conn, conn_fd, sse_timeout] {
-                relay_stream(agent, conn, sse_timeout);
+            relay_threads_.emplace_back([this, agent, conn_ref, sse_timeout] {
+                relay_stream(agent, conn_ref, sse_timeout);
 
-                // 中继结束: 清除标记后本线程即为该连接的最后使用者,
-                // 可安全摘除 (reap 之后不得再访问 conn)。
-                conn->unmark_streaming();
-                if (reap_connection_) {
-                    reap_connection_(conn_fd);
-                }
+                // 中继结束: 只清标记并归还引用; 销毁由扫描线程在确认无人引用后进行
+                conn_ref->unmark_streaming();
                 active_relays_.fetch_sub(1, std::memory_order_acq_rel);
                 relay_cv_.notify_all();
             });
@@ -363,7 +362,7 @@ void Router::dispatch_relay(AgentClient* agent, Connection* conn,
 // ============================================================================
 // 在独立线程中阻塞收取 Agent 帧并实时推送给客户端。持有 Connection*/AgentClient*
 // 裸指针, 生命周期由 Server/Router 保证 (排空在两者销毁之前完成)。
-void Router::relay_stream(AgentClient* agent, Connection* conn,
+void Router::relay_stream(AgentClient* agent, std::shared_ptr<Connection> conn,
                           SSERelayTimeout sse_timeout) {
     // --- 初始化 SSE 中继器 ---
     SSERelayHandler relay(sse_timeout);

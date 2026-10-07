@@ -26,6 +26,7 @@
 
 #include <vector>
 #include <thread>
+#include <atomic>
 #include <memory>
 #include <unordered_map>
 #include <mutex>
@@ -103,13 +104,16 @@ private:
 
     // --- 连接管理 ---
     std::mutex connections_mutex_;
-    std::unordered_map<socket_t, std::unique_ptr<Connection>> connections_;
+    std::unordered_map<uint64_t, std::shared_ptr<Connection>> connections_;
+    std::atomic<uint64_t> next_connection_id_{1};   // 连接 id 分配器
 
-    // 注册/注销连接
+    // 注册/注销连接 (主键是连接 id, 不是 fd)
+    // 不能用 fd 当主键: close() 后内核立刻复用该 fd 号, 而连接对象可能尚未摘除,
+    // 用 fd 做主键会让新连接覆盖并析构仍在被使用的旧连接 (实测 double-free)。
     // remove_connection 只允许由该连接的"最后使用者"调用 (处理完其完成事件的
     // worker 线程, 或持有它的 SSE 中继线程), 否则会 use-after-free
-    void add_connection(socket_t fd, std::unique_ptr<Connection> conn);
-    void remove_connection(socket_t fd);
+    void add_connection(uint64_t conn_id, std::shared_ptr<Connection> conn);
+    void remove_connection(uint64_t conn_id);
 
     // --- 状态 ---
     bool started_ = false;

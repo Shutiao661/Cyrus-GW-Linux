@@ -56,9 +56,12 @@ void IOEngineUring::shutdown() {
     shutting_down_.store(true, std::memory_order_release);
 
 #if CYRUS_HAS_LIBURING
+    {
+    std::lock_guard<std::mutex> lk(ring_mutex_);
     for (int i = 0; i < 64; ++i) {
         struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
         if (sqe) { io_uring_prep_nop(sqe); sqe->user_data = 0; io_uring_submit(&ring_); }
+    }
     }
     io_uring_queue_exit(&ring_);
     if (listen_fd_ != INVALID_SOCKET_VAL) {
@@ -122,6 +125,7 @@ int IOEngineUring::post_accept(socket_t listen_fd, IOContext* base_ctx) {
     }
 
 #if CYRUS_HAS_LIBURING
+    std::lock_guard<std::mutex> lk(ring_mutex_);
     UringContext* ctx = static_cast<UringContext*>(base_ctx);
     struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
     if (!sqe) { LOG_ERROR("SQ full"); return -1; }
@@ -182,6 +186,7 @@ int IOEngineUring::post_accept(socket_t listen_fd, IOContext* base_ctx) {
 // ============================================================================
 int IOEngineUring::post_recv(socket_t fd, IOContext* base_ctx) {
 #if CYRUS_HAS_LIBURING
+    std::lock_guard<std::mutex> lk(ring_mutex_);
     UringContext* ctx = static_cast<UringContext*>(base_ctx);
     struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
     if (!sqe) { LOG_ERROR("SQ full"); return -1; }
@@ -220,6 +225,7 @@ int IOEngineUring::post_recv(socket_t fd, IOContext* base_ctx) {
 // ============================================================================
 int IOEngineUring::post_send(socket_t fd, IOContext* base_ctx) {
 #if CYRUS_HAS_LIBURING
+    std::lock_guard<std::mutex> lk(ring_mutex_);
     UringContext* ctx = static_cast<UringContext*>(base_ctx);
     struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
     if (!sqe) { LOG_ERROR("SQ full"); return -1; }
@@ -257,55 +263,77 @@ int IOEngineUring::wait_completions(IOContext** contexts, int max_events,
                                      int timeout_ms) {
 #if CYRUS_HAS_LIBURING
     if (shutting_down_.load(std::memory_order_acquire)) return 0;
-    struct io_uring_cqe* cqes[128];
-    int to_get = (max_events < 128) ? max_events : 128;
-    int ret;
-    if (timeout_ms < 0) {
-        ret = io_uring_wait_cqe(&ring_, &cqes[0]);
-        if (ret == 0) to_get = 1; else return 0;
-    } else if (timeout_ms == 0) {
-        ret = io_uring_peek_batch_cqe(&ring_, cqes, static_cast<unsigned>(to_get));
-        if (ret < 0) return 0;
-        to_get = ret;
-    } else {
-        ret = io_uring_peek_batch_cqe(&ring_, cqes, static_cast<unsigned>(to_get));
-        if (ret > 0) { to_get = ret; }
-        else {
-            struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
-            if (sqe) {
-                struct __kernel_timespec ts;
-                ts.tv_sec = timeout_ms / 1000;
-                ts.tv_nsec = (timeout_ms % 1000) * 1000000;
-                io_uring_prep_timeout(sqe, &ts, 0, 0);
-                sqe->user_data = 0; io_uring_submit(&ring_);
+    const unsigned want = static_cast<unsigned>((max_events < 128) ? max_events : 128);
+
+    // --- 阶段 1: 决定是否需要阻塞 (锁内只做 peek 与超时 SQE 投递) ---
+    bool need_block = false;
+    {
+        std::lock_guard<std::mutex> lk(ring_mutex_);
+        struct io_uring_cqe* peeked[128];
+        int ready = io_uring_peek_batch_cqe(&ring_, peeked, want);
+        if (ready <= 0) {
+            if (timeout_ms < 0) {
+                need_block = true;
+            } else if (timeout_ms > 0) {
+                struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+                if (sqe) {
+                    struct __kernel_timespec ts;
+                    ts.tv_sec = timeout_ms / 1000;
+                    ts.tv_nsec = (static_cast<long long>(timeout_ms) % 1000) * 1000000;
+                    io_uring_prep_timeout(sqe, &ts, 0, 0);
+                    sqe->user_data = 0;
+                    io_uring_submit(&ring_);
+                }
+                need_block = true;
             }
-            ret = io_uring_wait_cqe(&ring_, &cqes[0]);
-            if (ret < 0) return 0;
-            if (cqes[0]->user_data == 0) { io_uring_cqe_seen(&ring_, cqes[0]); return 0; }
-            to_get = 1;
+            // timeout_ms == 0: 不阻塞, 直接返回 0
         }
     }
-    int count = 0;
-    for (int i = 0; i < to_get && i < 128; ++i) {
-        struct io_uring_cqe* cqe = cqes[i];
-        if (cqe->user_data == 0) { io_uring_cqe_seen(&ring_, cqe); continue; }
-        UringContext* ctx = UringContext::decode_ctx(cqe->user_data);
-        if (cqe->res >= 0) { ctx->bytes_transferred = static_cast<size_t>(cqe->res); ctx->error = 0; }
-        else { ctx->bytes_transferred = 0; ctx->error = -cqe->res; }
-        // ACCEPT 操作的结果是新的连接 fd (而非字节数)
-        if (UringContext::decode_op(cqe->user_data) == IOOperation::ACCEPT && cqe->res >= 0) {
-            ctx->accept_fd = static_cast<socket_t>(cqe->res);
-        }
-        // CQE 先归还内核再回调: 回调里恢复的协程会立刻投递下一个操作
-        io_uring_cqe_seen(&ring_, cqe);
 
-        // 协程路径: 回调内 resume 挂起的协程。恢复后协程可能立即
-        // 结束并销毁自己的帧 (detach 的任务), 因此回调返回后不得再访问 ctx。
+    // --- 阶段 2: 阻塞等待必须在锁外 (wait_cqe 不推进 CQ 队头)。
+    // 若持锁阻塞, 其他 worker 将无法提交任何 I/O。 ---
+    if (need_block) {
+        struct io_uring_cqe* one = nullptr;
+        if (io_uring_wait_cqe(&ring_, &one) < 0) return 0;
+    }
+
+    // --- 阶段 3: 锁内收割 (peek + 填充 + cqe_seen 都触碰 CQ, 必须串行) ---
+    UringContext* ready[128];
+    int ready_count = 0;
+    {
+        std::lock_guard<std::mutex> lk(ring_mutex_);
+        struct io_uring_cqe* cqes[128];
+        int n = io_uring_peek_batch_cqe(&ring_, cqes, want);
+        if (n < 0) return 0;
+        for (int i = 0; i < n && ready_count < 128; ++i) {
+            struct io_uring_cqe* cqe = cqes[i];
+            if (cqe->user_data == 0) { io_uring_cqe_seen(&ring_, cqe); continue; }  // nop/timeout
+            UringContext* ctx = UringContext::decode_ctx(cqe->user_data);
+            if (cqe->res >= 0) {
+                ctx->bytes_transferred = static_cast<size_t>(cqe->res);
+                ctx->error = 0;
+            } else {
+                ctx->bytes_transferred = 0;
+                ctx->error = -cqe->res;
+            }
+            // ACCEPT 的结果是新连接 fd (而非字节数)
+            if (UringContext::decode_op(cqe->user_data) == IOOperation::ACCEPT && cqe->res >= 0) {
+                ctx->accept_fd = static_cast<socket_t>(cqe->res);
+            }
+            io_uring_cqe_seen(&ring_, cqe);
+            ready[ready_count++] = ctx;
+        }
+    }
+
+    // --- 阶段 4: 锁外分发。回调里恢复的协程会立刻投递下一个操作 (post_* 要取同一把锁),
+    // 持锁回调会自死锁; 且回调返回后 ctx 可能已被协程销毁 (detach 的帧自毁)。 ---
+    int count = 0;
+    for (int i = 0; i < ready_count; ++i) {
+        IOContext* ctx = ready[i];
         if (ctx->on_complete) {
             ctx->on_complete(ctx);
             continue;
         }
-
         contexts[count++] = ctx;
     }
     return count;
@@ -356,6 +384,7 @@ int IOEngineUring::wait_completions(IOContext** contexts, int max_events,
 // ============================================================================
 void IOEngineUring::post_wakeup() {
 #if CYRUS_HAS_LIBURING
+    std::lock_guard<std::mutex> lk(ring_mutex_);
     struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
     if (sqe) { io_uring_prep_nop(sqe); sqe->user_data = 0; io_uring_submit(&ring_); }
 #else

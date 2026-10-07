@@ -72,14 +72,6 @@ public:
     // 必须在 Server 关闭 Connection 对象之前调用, 避免 use-after-free
     void drain_relays();
 
-    // --- 连接摘除回调 ---
-    // 中继线程是流式连接的最后使用者, 结束时需要把它从 Server 的连接表中摘除。
-    // 由 Server 注入 (回调内调用 Server::remove_connection)。
-    using ConnectionReaper = std::function<void(socket_t fd)>;
-    void set_connection_reaper(ConnectionReaper reaper) {
-        reap_connection_ = std::move(reaper);
-    }
-
 private:
     // --- 路由表 ---
     struct Route {
@@ -117,14 +109,13 @@ private:
     std::condition_variable relay_cv_;
     int max_concurrent_relays_ = 256;            // 最大并发流式连接数
     std::vector<std::thread> relay_threads_;     // 可 join 的中继线程 (排空时 join)
-    ConnectionReaper reap_connection_;           // 中继结束后摘除连接 (由 Server 注入)
 
     // 将聊天请求分发到独立中继线程 (有界并发)
     void dispatch_relay(AgentClient* agent, Connection* conn,
                         SSERelayTimeout sse_timeout);
 
     // 中继线程主体: 阻塞收取 Agent 帧并实时推送给客户端
-    void relay_stream(AgentClient* agent, Connection* conn,
+    void relay_stream(AgentClient* agent, std::shared_ptr<Connection> conn,
                       SSERelayTimeout sse_timeout);
 
     // --- 默认处理函数 ---

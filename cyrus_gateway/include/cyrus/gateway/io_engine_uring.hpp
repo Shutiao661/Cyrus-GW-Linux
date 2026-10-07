@@ -81,6 +81,17 @@ private:
 #endif
     std::atomic<bool> shutting_down_{false};
 
+    // SQ/CQ 串行化锁。
+    // liburing 的 io_uring_get_sqe()/io_uring_submit() 不是线程安全的: SQ 队尾
+    // 是非原子的, 两个 worker 并发提交会拿到同一个 SQE 槽, 造成 SQE 被覆盖、
+    // 完成事件与操作错配 (实测表现为 accept 完成里 decode 出别的操作类型、
+    // 以及 ctx 被重复回收引发的 use-after-free)。
+    // 因此提交与收割都必须串行化。阻塞等待 (io_uring_wait_cqe) 不推进 CQ 队头,
+    // 放在锁外做, 否则一个 worker 阻塞会让其他线程无法提交。
+    // 注: 更彻底的做法是每线程独立 ring (IORING_SETUP_SQPOLL/ATTACH_WQ),
+    // 这里先用锁保证正确性。
+    std::mutex ring_mutex_;
+
     // UringContext 对象池
     std::vector<std::unique_ptr<UringContext>> context_pool_;
     std::vector<UringContext*> free_contexts_;
